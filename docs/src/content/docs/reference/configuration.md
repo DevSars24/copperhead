@@ -5,9 +5,9 @@ sidebar:
   order: 2
 ---
 
-## `.copperhead/config.json`
+## `config.json`
 
-Written by `copperhead init`. Every key is optional; the defaults below apply when a key is absent or the file does not exist.
+`.copperhead/config.json`, written by `copperhead init`. Every key is optional; the defaults below apply when a key is absent or the file does not exist.
 
 ```json
 {
@@ -52,9 +52,9 @@ Budgets are hard constraints, not hints. A change that would exceed one is refus
 
 The names are yours. copperhead passes them through verbatim and expects the units to be in the key, as in `sleep_current_uA`.
 
-## `.copperhead/constraints.json`
+## `constraints.json`
 
-The constraint registry: machine-readable counterparts to the constraints stated in your design docs. Constraints are dual-written, to the doc and to the registry, and the sync-obligations ledger refuses to let a run commit if one was updated without the other.
+`.copperhead/constraints.json` is the constraint registry: machine-readable counterparts to the constraints stated in your design docs. Constraints are dual-written, to the doc and to the registry, and the sync-obligations ledger refuses to let a run commit if one was updated without the other.
 
 ## Environment variables
 

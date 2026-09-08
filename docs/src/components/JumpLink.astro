@@ -40,6 +40,11 @@ const { href, title, description, icon } = Astro.props;
 			border-color 0.15s,
 			transform 0.15s;
 	}
+	/* Starlight's content-spacing rule skips <a> siblings, so the first link
+	   would otherwise sit flush against the heading above it. */
+	.jump-link {
+		margin-top: 1rem;
+	}
 	.jump-link + .jump-link {
 		margin-top: 0.75rem;
 	}

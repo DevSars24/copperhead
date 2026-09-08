@@ -1,6 +1,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightLlmsTxt from 'starlight-llms-txt';
+import rehypeTableLabels from './src/plugins/rehype-table-labels.mjs';
 
 const REPO = 'https://github.com/copperheadhq/copperhead';
 
@@ -9,6 +10,7 @@ const REPO = 'https://github.com/copperheadhq/copperhead';
 // so Pages cannot own a path under it.
 export default defineConfig({
   site: 'https://docs.copperhead.sh',
+  markdown: { rehypePlugins: [rehypeTableLabels] },
   integrations: [
     starlight({
       title: 'copperhead',
@@ -37,6 +39,9 @@ export default defineConfig({
         './src/styles/custom.css',
       ],
       expressiveCode: {
+        // Long lines wrap instead of scrolling: sample briefs, prompts, and
+        // commands are prose-like and were being cut off on phones.
+        defaultProps: { wrap: true, preserveIndent: true },
         styleOverrides: {
           borderRadius: '0.75rem',
           codeFontFamily: "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
