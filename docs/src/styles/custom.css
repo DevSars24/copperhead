@@ -308,11 +308,19 @@ mobile-starlight-toc .toggle {
 	text-decoration-color: currentColor;
 }
 
+/* Inline code. Short single-token spans are marked "nowrap" at build time
+ * (src/plugins/rehype-table-labels.mjs) so `--json` or `kicad-cli` can never
+ * break at the hyphen. A longer token is left unmarked and break-word lets it
+ * break rather than overflow the column, and when a span does wrap each
+ * fragment keeps its own rounded chip. */
 .sl-markdown-content code:not(:where(.not-content *)) {
-	padding: 0.1em 0.4em;
+	padding: 0.1em 0.3em;
 	border-radius: 0.375rem;
 	box-shadow: inset 0 0 0 1px var(--sl-color-gray-5);
 	font-size: 0.875em;
+	overflow-wrap: break-word;
+	-webkit-box-decoration-break: clone;
+	box-decoration-break: clone;
 }
 
 .sl-markdown-content blockquote:not(:where(.not-content *)) {
@@ -332,6 +340,104 @@ mobile-starlight-toc .toggle {
 	border-bottom-color: var(--sl-color-gray-5);
 }
 
+.sl-markdown-content :is(code.nowrap, code .nowrap):not(:where(.not-content *)) {
+	white-space: nowrap;
+}
+
+/* Nested lists in a narrow column: a code block inside a list inside a list
+ * was being squeezed to about two thirds of the column. Keyed off the column
+ * and not the viewport, for the same reason the table rules below are. */
+@container (max-width: 39.99rem) {
+	.sl-markdown-content :is(ul, ol) :is(ul, ol):not(:where(.not-content *)) {
+		padding-inline-start: 1rem;
+	}
+}
+
+/* ---- Tables --------------------------------------------------------------
+ * Starlight renders a table as a scrolling block sized to its content, which
+ * leaves a ragged right edge next to full-width code blocks. The build wraps
+ * each table in .table-wrap (src/plugins/rehype-table-labels.mjs), so the
+ * table can be a real full-width table and the wrapper handles overflow.
+ *
+ * The content column is a size container, so the table layout follows the
+ * width the table actually has rather than the viewport: with the sidebar
+ * open on a tablet the column is only ~500px wide and a four-column table
+ * was crushed into one-word ribbons. Below 34rem of column width each row
+ * becomes a card, one cell per line, labelled with its column header
+ * (data-label, stamped by the same plugin). The header row stays in the DOM
+ * for assistive tech but leaves the flow.
+ * ---------------------------------------------------------------------- */
+
+.sl-markdown-content {
+	container-type: inline-size;
+}
+.sl-markdown-content .table-wrap:not(:where(.not-content *)) {
+	overflow-x: auto;
+}
+.sl-markdown-content table:not(:where(.not-content *)) {
+	display: table;
+	width: 100%;
+	overflow: visible;
+}
+.sl-markdown-content th:not(:where(.not-content *)) {
+	white-space: nowrap;
+}
+/* Identifiers in the first column (options, keys, commands) stay on one line;
+ * the description column is the one that should give. */
+.sl-markdown-content :is(th, td):first-child code:not(:where(.not-content *)) {
+	white-space: nowrap;
+}
+
+@container (max-width: 33.99rem) {
+	.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+		font-size: var(--sl-text-sm);
+	}
+	.sl-markdown-content :is(table, tbody, tr, td):not(:where(.not-content *)) {
+		display: block;
+	}
+	.sl-markdown-content thead:not(:where(.not-content *)) {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		white-space: nowrap;
+	}
+	.sl-markdown-content tr:not(:where(.not-content *)) {
+		padding: 0.25rem 1rem;
+		border: 1px solid var(--sl-color-gray-5);
+		border-radius: 0.75rem;
+	}
+	.sl-markdown-content tr:not(:where(.not-content *)) + tr {
+		margin-top: 0.75rem;
+	}
+	.sl-markdown-content td:not(:where(.not-content *)) {
+		padding: 0.625rem 0;
+		border-bottom: 0;
+		overflow-wrap: anywhere;
+	}
+	.sl-markdown-content td:empty:not(:where(.not-content *)) {
+		display: none;
+	}
+	.sl-markdown-content td:not(:where(.not-content *)) + td {
+		border-top: 1px solid var(--sl-color-gray-5);
+	}
+	/* A card is a block now, so first-column code may wrap like any other. */
+	.sl-markdown-content td:first-child code:not(:where(.not-content *)) {
+		white-space: normal;
+	}
+	.sl-markdown-content td[data-label]:not(:where(.not-content *))::before {
+		content: attr(data-label);
+		display: block;
+		margin-bottom: 0.2rem;
+		font-size: 0.6875rem;
+		font-weight: 700;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--sl-color-gray-3);
+	}
+}
+
 .sl-markdown-content kbd:not(:where(.not-content *)) {
 	padding: 0.1em 0.4em;
 	border: 1px solid var(--sl-color-gray-5);
@@ -339,6 +445,12 @@ mobile-starlight-toc .toggle {
 	background-color: var(--sl-color-gray-6);
 	font-family: var(--__sl-font-mono);
 	font-size: 0.8em;
+}
+
+/* Steps: the guide line ran on below the last step's text (the step keeps
+ * its last paragraph's bottom margin inside it), connecting to nothing. */
+.sl-steps > li:last-child::after {
+	display: none;
 }
 
 /* Asides: rounded, quietly tinted cards instead of a heavy left border. */
