@@ -41,6 +41,8 @@ Docs that disagree with the schematic are the failure mode this whole tool exist
 
 Hand edits that desync the docs, the constraint registry, or the schematic fail at commit time. See [Verify and sync](/workflows/verify-and-sync/).
 
+<a id="copperheadreadmemd"></a>
+
 ## `README.md` in `.copperhead/`
 
 The config directory describes itself. `init` writes a README into `.copperhead/` documenting every key in `config.json` and what `constraints.json` is for, so someone who clones the repo and has never used copperhead can still tell what these files are.

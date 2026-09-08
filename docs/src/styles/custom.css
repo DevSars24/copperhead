@@ -308,11 +308,19 @@ mobile-starlight-toc .toggle {
 	text-decoration-color: currentColor;
 }
 
+/* Inline code. Short single-token spans are marked "nowrap" at build time
+ * (src/plugins/rehype-table-labels.mjs) so `--json` or `kicad-cli` can never
+ * break at the hyphen. A longer token is left unmarked and break-word lets it
+ * break rather than overflow the column, and when a span does wrap each
+ * fragment keeps its own rounded chip. */
 .sl-markdown-content code:not(:where(.not-content *)) {
 	padding: 0.1em 0.3em;
 	border-radius: 0.375rem;
 	box-shadow: inset 0 0 0 1px var(--sl-color-gray-5);
 	font-size: 0.875em;
+	overflow-wrap: break-word;
+	-webkit-box-decoration-break: clone;
+	box-decoration-break: clone;
 }
 
 .sl-markdown-content blockquote:not(:where(.not-content *)) {
@@ -332,21 +340,14 @@ mobile-starlight-toc .toggle {
 	border-bottom-color: var(--sl-color-gray-5);
 }
 
-/* Inline code. Short single-token spans are marked "nowrap" at build time
- * (src/plugins/rehype-table-labels.mjs) so `--json` or `kicad-cli` can never
- * break at the hyphen; longer spans still wrap so they fit a phone column,
- * and when they do each fragment keeps its own rounded chip. */
-.sl-markdown-content code:not(:where(.not-content *)) {
-	-webkit-box-decoration-break: clone;
-	box-decoration-break: clone;
-}
 .sl-markdown-content :is(code.nowrap, code .nowrap):not(:where(.not-content *)) {
 	white-space: nowrap;
 }
 
-/* Nested lists on phones: a code block inside a list inside a list was
- * being squeezed to about two thirds of the column. */
-@media (max-width: 39.99rem) {
+/* Nested lists in a narrow column: a code block inside a list inside a list
+ * was being squeezed to about two thirds of the column. Keyed off the column
+ * and not the viewport, for the same reason the table rules below are. */
+@container (max-width: 39.99rem) {
 	.sl-markdown-content :is(ul, ol) :is(ul, ol):not(:where(.not-content *)) {
 		padding-inline-start: 1rem;
 	}

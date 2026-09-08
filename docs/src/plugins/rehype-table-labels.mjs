@@ -10,8 +10,9 @@
  * - Inline code never breaks inside a token: a short single-token span
  *   (`--json`, `kicad-cli`) gets class "nowrap", and a multi-word span
  *   (`--model claude-code`) has each token wrapped in <span class="nowrap">
- *   so it can only wrap at the spaces. Tokens longer than NOWRAP_MAX_CHARS
- *   are left alone so nothing can overflow a phone column.
+ *   so it can only wrap at the spaces. A token longer than NOWRAP_MAX_CHARS is
+ *   left unmarked, so the stylesheet's overflow-wrap can break it rather than
+ *   let it overflow a narrow column.
  *
  * See the "Tables" and "Inline code" blocks in src/styles/custom.css.
  */
@@ -37,10 +38,12 @@ function addClass(node, name) {
 }
 
 function visit(node, fn, parent = null, inPre = false) {
-  const replacement = fn(node, parent, inPre);
+  fn(node, parent, inPre);
+  // Children of a <pre> are code-block content: expressive-code owns them, and
+  // wrapping tokens in there would corrupt every sample.
   const next = inPre || (node.type === 'element' && node.tagName === 'pre');
+  // Copied, because fn may replace this node in its parent as it goes.
   for (const child of [...(node.children ?? [])]) visit(child, fn, node, next);
-  return replacement;
 }
 
 export default function rehypeTableLabels() {

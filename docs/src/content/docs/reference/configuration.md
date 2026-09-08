@@ -5,6 +5,8 @@ sidebar:
   order: 2
 ---
 
+<a id="copperheadconfigjson"></a>
+
 ## `config.json`
 
 `.copperhead/config.json`, written by `copperhead init`. Every key is optional; the defaults below apply when a key is absent or the file does not exist.
@@ -51,6 +53,8 @@ Budgets are hard constraints, not hints. A change that would exceed one is refus
 ```
 
 The names are yours. copperhead passes them through verbatim and expects the units to be in the key, as in `sleep_current_uA`.
+
+<a id="copperheadconstraintsjson"></a>
 
 ## `constraints.json`
 
