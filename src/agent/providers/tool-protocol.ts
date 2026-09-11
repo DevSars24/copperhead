@@ -170,25 +170,25 @@ export function parseToolCalls(
     if (result) {
       if (result.kind === 'accepted') {
         toolCalls.push(result.call);
+        matched.push([span.start, span.end]);
       } else {
         withheld.push({ name: result.name, args: result.args, reason: 'not in this turn\'s tool catalog' });
       }
-      matched.push([span.start, span.end]);
     }
     searchFrom = span.end;
   }
 
-  if (!toolCalls.length && !withheld.length) {
-    // No call dispatched and nothing withheld — but did the model clearly *intend*
-    // one? A fenced ```json block that names a catalog tool yet produced zero calls
-    // is a malformed near-miss (unbalanced braces, a missing `}`, or an inner object
+  if (!toolCalls.length) {
+    // No call dispatched — but did the model clearly *intend* one? A fenced
+    // ```json block that names a catalog tool yet produced zero calls is a
+    // malformed near-miss (unbalanced braces, a missing `}`, or an inner object
     // with no `tool` key). Silently dropping it gives the model no signal, so it
     // misreads "no result" as "this tool is broken" and can bake that false
     // conclusion into a committed summary (#I10). Surface a nudge instead.
     return { text: text.trim() ? text : null, toolCalls, withheld, nudge: detectMalformedCall(text, catalog) };
   }
 
-  // Prose is whatever survives once the tool-call objects (and any now-empty
+  // Prose is whatever survives once the accepted tool-call objects (and any now-empty
   // ```json fences around them) are removed.
   let prose = '';
   let cursor = 0;
