@@ -317,6 +317,60 @@ program
     },
   );
 
+const skillCmd = program.command('skill').description('run a registered skill (nested tool loop; no git commit)');
+
+skillCmd
+  .command('list')
+  .description('list registered skills (LLM-free, network-free)')
+  .action(async () => {
+    const repo = repoOf(program.opts());
+    try {
+      const { listSkills } = await import('./commands/skill.js');
+      const skills = await listSkills(repo);
+      if (program.opts().json) console.log(JSON.stringify(skills, null, 2));
+      else {
+        for (const s of skills) {
+          console.log(`${s.available ? '·' : '×'} ${s.name.replaceAll('_', '-')}  ${s.description.split('\n')[0]}`);
+        }
+      }
+      process.exit(0);
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+  });
+
+skillCmd
+  .command('run')
+  .description('run a skill by name (generate-report)')
+  .argument('<name>', 'skill name (kebab or underscore)')
+  .option('--model <model>', 'codex | cursor | gpt-5 | claude | claude-code | compat:<id>')
+  .option('--scope <scope>', 'generate-report scope: power | all', 'all')
+  .action(async (name: string, opts: { model?: string; scope?: string }) => {
+    const repo = repoOf(program.opts());
+    const json = Boolean(program.opts().json);
+    // `process.exit` skips pending finally blocks, so the provider close has to
+    // finish before the exit call — hence the code is carried out, not exited on.
+    let code = 1;
+    try {
+      const { runSkillCli, providerForSkillRun } = await import('./commands/skill.js');
+      const { provider } = await providerForSkillRun(repo, opts.model);
+      const res = await runSkillCli({
+        repoRoot: repo,
+        name,
+        args: { scope: opts.scope === 'power' ? 'power' : 'all' },
+        provider,
+        json,
+      });
+      console.log(res.text);
+      code = res.code;
+    } catch (err) {
+      console.error((err as Error).message);
+      code = 1;
+    }
+    process.exit(code);
+  });
+
 program
   .command('sync')
   .description('verify the whole design state for inconsistencies and resolve drift')
@@ -347,6 +401,29 @@ program
         meta: { command: 'sync', modelSource: source, version, kicadCliVersion: kicadVer },
       });
       process.exit(res.ok ? 0 : 1);
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('mcp')
+  .description('EXPERIMENTAL: serve the gated pipeline to MCP hosts over stdio (unstable surface)')
+  // `--repo` is also a global flag, but a host config reads as
+  // `args: ["mcp", "--repo", "/path"]`, so the command accepts it locally too.
+  .option('--repo <path>', 'target repository (default: cwd)')
+  .action(async (opts: { repo?: string }) => {
+    const repo = repoOf(opts.repo ? { repo: opts.repo } : program.opts());
+    try {
+      // Imported lazily, like `skill`: the MCP SDK and zod are a ~150ms load
+      // that every other command — including the pre-commit `check` — would
+      // otherwise pay, and a resolution failure here would take down the whole
+      // CLI rather than just this command.
+      const { startMcpServer } = await import('./mcp/server.js');
+      // Never returns until the host closes stdio. Nothing is printed to
+      // stdout here or anywhere downstream: it carries JSON-RPC alone.
+      await startMcpServer({ repoRoot: repo });
     } catch (err) {
       console.error((err as Error).message);
       process.exit(1);

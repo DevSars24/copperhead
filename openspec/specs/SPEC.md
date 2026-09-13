@@ -280,6 +280,14 @@ copperhead score schematic [--json]
 copperhead do "<change request>" [--model codex|gpt-5|claude] [--max-turns N]
     The core loop. See §4.
 
+copperhead skill list
+    Print registered skills and whether each is available. LLM-free, network-free,
+    and does not create a run transcript/directory.
+
+copperhead skill run <name> [--scope power|all] [--model …]
+    Run a skill (currently `generate-report`) via the nested sub-run. Needs a
+    model, same as `do`. Does not snapshot or commit.
+
 copperhead check          (alias: copperhead verify)
     Run ERC + DRC + doc-drift check; exit non-zero on violations.
     No LLM calls. Usable as CI step / pre-commit hook.
@@ -294,6 +302,17 @@ copperhead sync [--dry-run]
     implies a requirement violation is flagged for the human, never
     silently rewritten. `--dry-run` prints the full inconsistency report
     and writes nothing. Idempotent: a second run finds nothing to do.
+
+copperhead mcp [--repo <path>]            # EXPERIMENTAL
+    Serve the gated pipeline to MCP hosts over stdio as five opaque,
+    outcome-level tools (copperhead_check / _do / _sync / _init / _doctor).
+    No file-edit, raw-KiCad, or partial-loop tool is exposed, so a host
+    agent cannot skip spec-gating or verification by any sequence of
+    calls; every mutating tool runs the same loop the CLI runs. The
+    surface declares a `0.` protocol major and is unstable: tool names,
+    inputs, and result shapes may change in any release. stdio only — the
+    server opens no network transport, and LLM calls happen exactly where
+    the CLI already makes them.
 
 copperhead explain <refdes|net|pin>       # stretch
     Answer "why is R7 here?" from docs + schematic context.
@@ -346,6 +365,7 @@ It's a loop, and it looks a lot like pair-programming, except the codebase is a 
 | `run_drc` | () → {violations: [...]} | `kicad-cli pcb drc --format json --exit-code-violations` |
 | `export_svg` | (sch\|pcb) → path | For viewer + before/after diffing |
 | `check_drift` | () → [{doc, claim, actual}] | Compares doc tables (BOM/pinout) against parsed schematic |
+| `generate_report` | (scope?: power\|all) → report | Skill: nested read-only sub-run; ERC/DRC/drift/nets. Always in the catalog. |
 
 ### 4.3 System prompt — key rules (verbatim requirements)
 
@@ -381,6 +401,8 @@ interface Provider {
 - On turn-budget exhaustion in an attended (TTY) run: print run stats (turns, files touched, open obligations, token usage) and ask whether to continue with more turns; declining, or a non-TTY run, fails as below. The extension can repeat; each is a fresh decision with fresh numbers.
 - On any unrecoverable failure: preserve the touched work as a git stash entry named `copperhead failed run <run-id>`, restore the snapshot, print the stash ref and transcript path, exit 1
 - Rate-limit (429): exponential backoff ×3, then fail over to the other **keyed** provider (`openai` ↔ `anthropic`) if a key exists; saved-login providers (`codex`, `claude-code`, `cursor`) never fail over to a keyed or alternate provider
+- Provider turn watchdog: a turn that goes `turnTimeoutMs` without a response or streamed progress is treated as hung, aborted, and retried up to 3 times before failing as above. A streaming provider's progress restarts that deadline, so a long turn that keeps producing output is not killed; a provider that reports no progress gets `turnTimeoutMs` as a whole-turn deadline. `turnMaxMs` caps a turn that is producing output, however much it streams, and is never shorter than `turnTimeoutMs`: a turn that reaches it is too large rather than hung, so it fails as above without a retry. A turn that has reported no progress is judged by `turnTimeoutMs` alone.
+- Nested skill provider turns use the same bounded timeout (inactivity deadline and hard cap) and 429 backoff policy. A provider error inside a skill becomes a failed tool envelope, so it cannot escape the parent loop and bypass its failure/rollback path.
 - The Anthropic provider marks `cache_control` breakpoints (system prompt, last tool, last message block) so the resent conversation prefix is cached; reported input tokens include cache reads/writes
 
 ---
@@ -395,11 +417,14 @@ interface Provider {
   "model": "gpt-5",
   "maxTurns": 40,
   "stageMaxTurns": { "spec-seed": 60 },
+  "turnTimeoutMs": 600000,
+  "turnMaxMs": 3600000,
+  "heartbeatMs": 30000,
   "budgets": { "sleep_current_uA": 25 }
 }
 ```
 
-`budgets` is free-form; keys are surfaced verbatim into the system prompt so the agent treats them as hard constraints. `stageMaxTurns` is optional: per-stage turn budgets for the create pipeline, keyed by stage name; stages without an entry use `maxTurns`.
+`budgets` is free-form; keys are surfaced verbatim into the system prompt so the agent treats them as hard constraints. `stageMaxTurns` is optional: per-stage turn budgets for the create pipeline, keyed by stage name; stages without an entry use `maxTurns`. `turnTimeoutMs`, `turnMaxMs` and `heartbeatMs` are optional, with the defaults shown: the per-turn inactivity deadline, the hard cap on a single turn, and the interval of the liveness line printed while a turn is in flight (see §4.5). A value `<= 0` disables each. When `turnTimeoutMs` is disabled and `turnMaxMs` is unset, `turnMaxMs` is disabled too.
 
 ---
 
@@ -419,6 +444,7 @@ Acceptance: type "add a second RGB LED on an RTC-capable pin" → watch schemati
 
 - Refuse to run `do` or `repl` on a dirty git tree (offer `--allow-dirty`, whose snapshot pairs a `git stash create` object for tracked changes with a tree object for untracked files, so the rollback restores both rather than letting `git clean` delete what the stash never captured). An untracked file that exists but cannot be read refuses the run by name: it cannot be snapshotted, and the rollback would delete it regardless, so proceeding would break exactly the promise `--allow-dirty` makes. Untracked paths that vanish before the snapshot is taken are skipped rather than refused
 - All file tools sandboxed to repo root; no network tools in Phase 1
+- Every rail above applies identically to the MCP entry point (`copperhead mcp`), which is a transport adapter over the same command entry points and adds no privileges of its own. Any path a host supplies is contained to the repo root by `resolveInRepo` before use, exactly as a CLI-supplied path is
 - `.env` in `.gitignore` from first commit; keys only via env vars — never written to any file, transcript, or commit
 - Transcripts in `.copperhead/runs/` redact anything matching `sk-[A-Za-z0-9_-]+`
 - The Codex CLI's native read access and `~/.codex/sessions/` logs are outside Copperhead's enforcement/redaction boundary; the Codex path documents this host-local exposure explicitly
