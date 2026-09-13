@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { withTimeout, TurnTimeoutError, parseDiagnosis, diagnoseStageFailure } from '../src/agent/recovery.js';
+import { withTimeout, withWatchdog, TurnTimeoutError, parseDiagnosis, diagnoseStageFailure } from '../src/agent/recovery.js';
 import { CachingProvider } from '../src/agent/response-cache.js';
 import type { Msg, Provider, ToolSchema, Turn } from '../src/agent/types.js';
 
@@ -39,6 +39,83 @@ describe('withTimeout (turn watchdog)', () => {
 
   it('disables the watchdog when ms <= 0 (awaits the call)', async () => {
     expect(await withTimeout(() => Promise.resolve('ok'), 0)).toBe('ok');
+  });
+});
+
+describe('withWatchdog (inactivity deadline + hard cap)', () => {
+  const hang = () => new Promise<never>(() => {});
+
+  it('keeps a call alive past idleMs while it reports activity', async () => {
+    const slow = (activity: () => void) =>
+      new Promise<string>((resolve) => {
+        const tick = setInterval(activity, 20);
+        setTimeout(() => {
+          clearInterval(tick);
+          resolve('done');
+        }, 300);
+      });
+    expect(await withWatchdog(slow, { idleMs: 100 })).toBe('done');
+  });
+
+  it('gives a call that reports no activity idleMs as a plain deadline', async () => {
+    let cleaned = false;
+    const err = await withWatchdog(hang, { idleMs: 50, onTimeout: () => { cleaned = true; } }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TurnTimeoutError);
+    expect((err as TurnTimeoutError).kind).toBe('idle');
+    expect(cleaned).toBe(true);
+  });
+
+  it('fires the idle deadline once progress stops', async () => {
+    const start = Date.now();
+    let tick: ReturnType<typeof setInterval> | undefined;
+    const stalls = (activity: () => void) => {
+      tick = setInterval(activity, 20);
+      setTimeout(() => clearInterval(tick), 150); // progress, then silence
+      return hang();
+    };
+    const err = await withWatchdog(stalls, { idleMs: 80 }).catch((e: unknown) => e);
+    clearInterval(tick);
+    expect((err as TurnTimeoutError).kind).toBe('idle');
+    expect(Date.now() - start).toBeGreaterThanOrEqual(200);
+  });
+
+  it('stops a call at the hard cap however much activity it reports', async () => {
+    let cleaned = false;
+    let tick: ReturnType<typeof setInterval> | undefined;
+    const streamsForever = (activity: () => void) => {
+      tick = setInterval(activity, 10);
+      return hang();
+    };
+    const err = await withWatchdog(streamsForever, {
+      idleMs: 60,
+      maxMs: 150,
+      onTimeout: () => {
+        cleaned = true;
+      },
+    }).catch((e: unknown) => e);
+    clearInterval(tick);
+    expect(err).toBeInstanceOf(TurnTimeoutError);
+    expect((err as TurnTimeoutError).kind).toBe('max');
+    expect((err as TurnTimeoutError).ms).toBe(150);
+    expect(cleaned).toBe(true);
+  });
+
+  it('settles on the timeout even when onTimeout rejects the call synchronously', async () => {
+    // A provider whose close() rejects its in-flight call at once (a plain,
+    // non-async chat) must still surface TurnTimeoutError, not the teardown error.
+    let rejectCall!: (e: Error) => void;
+    const call = () =>
+      new Promise<never>((_, reject) => {
+        rejectCall = reject;
+      });
+    const err = await withWatchdog(call, { idleMs: 30, onTimeout: () => rejectCall(new Error('closed')) }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(TurnTimeoutError);
+  });
+
+  it('disables both limits when <= 0', async () => {
+    expect(await withWatchdog(async () => 'ok', { idleMs: 0, maxMs: 0 })).toBe('ok');
   });
 });
 

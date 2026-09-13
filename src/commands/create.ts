@@ -905,9 +905,12 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
       // with the schematic stage: one header edit, ERC "clean" on an empty
       // sheet). Advancing anyway lets every later stage run against a design
       // that isn't there, so the completion contract is the real gate.
+      // The run's own reason rides along: the diagnosis transcript excerpt holds
+      // only assistant text and tool results, so without it a hung call or a turn
+      // stopped at the hard cap reaches the diagnosis as a bare "provider-error".
       const failure =
         res.outcome !== 'success'
-          ? `the run ended as "${res.outcome}" (${res.exitPath})`
+          ? `the run ended as "${res.outcome}" (${res.exitPath})${res.summary ? `: ${res.summary}` : ''}`
           : !(await stage.isComplete(opts.repoRoot, config.docs))
             ? await contractGapDetail(stage.name, opts.repoRoot, config)
             : null;

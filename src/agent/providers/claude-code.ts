@@ -62,6 +62,11 @@ export interface QueryOptions {
    * turns itself instead of us re-sending the whole conversation each turn (1.1,
    * `Options.resume`). Only set in the opt-in session-resume mode. */
   resume?: string;
+  /** Emit `stream_event` messages as the model generates, on top of the
+   * complete `assistant` message (Agent SDK `Options.includePartialMessages`).
+   * Used only as a progress signal for the turn watchdog and heartbeat; the
+   * reply is still read from the complete message. */
+  includePartialMessages?: boolean;
 }
 export interface QueryArgs {
   prompt: string;
@@ -73,6 +78,8 @@ export interface QueryMessage {
   session_id?: string;
   message?: { content?: Array<{ type: string; text?: string }> };
   usage?: { input_tokens?: number; output_tokens?: number };
+  /** On a `stream_event` message: the raw Messages-API stream event. */
+  event?: { type: string; delta?: { type: string; text?: string } };
 }
 export type QueryLike = (args: QueryArgs) => AsyncIterable<QueryMessage>;
 
@@ -153,6 +160,8 @@ export class ClaudeCodeProvider implements Provider {
     let text: string | null = null;
     let inputTokens = 0;
     let outputTokens = 0;
+    // Visible text streamed so far, for the heartbeat's count (see stream_event).
+    let streamedChars = 0;
     // One aborter per turn: close() aborts it to kill a hung subprocess.
     const aborter = new AbortController();
     this.inFlight.add(aborter);
@@ -163,6 +172,10 @@ export class ClaudeCodeProvider implements Provider {
           systemPrompt,
           ...(this.model ? { model: this.model } : {}),
           abortController: aborter,
+          // Partial-message events are the turn's progress signal: without them
+          // the SDK yields nothing until the reply is complete, so a turn that is
+          // still generating looks exactly like a hung one to the watchdog.
+          includePartialMessages: true,
           // Layered "the SDK executes nothing" defense (D1/D5):
           //  1. `tools: []` disables ALL built-in tools (Agent SDK 0.3.x docs:
           //     "[] (empty array) - Disable all built-in tools").
@@ -189,7 +202,15 @@ export class ClaudeCodeProvider implements Provider {
           maxTurns: 1,
         },
       })) {
-        if (msg.type === 'assistant') {
+        if (msg.type === 'stream_event') {
+          // Every partial event is progress (thinking and block boundaries too),
+          // and reporting it restarts the loop's inactivity watchdog; only text
+          // deltas grow the count. The reply itself is still read from the
+          // complete `assistant` message below, never reassembled from deltas.
+          const delta = msg.event?.delta;
+          if (delta?.type === 'text_delta' && delta.text) streamedChars += delta.text.length;
+          opts.onStream?.(streamedChars);
+        } else if (msg.type === 'assistant') {
           for (const block of msg.message?.content ?? []) {
             if (block.type === 'text' && block.text) {
               text = (text ?? '') + block.text;

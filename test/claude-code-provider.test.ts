@@ -57,6 +57,41 @@ function result(input = 0, output = 0): QueryMessage {
   return { type: 'result', subtype: 'success', usage: { input_tokens: input, output_tokens: output } };
 }
 
+/** A partial-message event, as the SDK emits with includePartialMessages. */
+function streamEvent(type: string, delta?: { type: string; text?: string }): QueryMessage {
+  return { type: 'stream_event', event: { type, ...(delta ? { delta } : {}) } };
+}
+
+describe('ClaudeCodeProvider — progress streaming (turn watchdog)', () => {
+  it('turns on partial messages and reports every stream event as progress', async () => {
+    let options: Record<string, unknown> = {};
+    const provider = new ClaudeCodeProvider(
+      undefined,
+      fakeQuery(
+        [
+          streamEvent('message_start'),
+          streamEvent('content_block_delta', { type: 'thinking_delta' }),
+          streamEvent('content_block_delta', { type: 'text_delta', text: 'hel' }),
+          streamEvent('content_block_delta', { type: 'text_delta', text: 'lo' }),
+          assistant('hello'),
+          result(),
+        ],
+        (a) => {
+          options = a.options ?? {};
+        },
+      ),
+    );
+    const progress: number[] = [];
+    const turn = await provider.chat(messages, tools, { onStream: (chars) => progress.push(chars) });
+    expect(options.includePartialMessages).toBe(true);
+    // Thinking and block boundaries are progress with an unchanged count; only
+    // text deltas grow it. The complete message still supplies the reply.
+    expect(progress).toEqual([0, 0, 3, 5, 5]);
+    expect(turn.text).toBe('hello');
+    await provider.close();
+  });
+});
+
 describe('ClaudeCodeProvider — routing', () => {
   it('makeProvider routes claude-code and claude-code:<id> to ClaudeCodeProvider (no API key needed)', async () => {
     expect(await makeProvider('claude-code')).toBeInstanceOf(ClaudeCodeProvider);
