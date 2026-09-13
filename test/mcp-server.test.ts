@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -243,15 +243,44 @@ describe('mutating tools are serialized per repo (spec: serialization)', () => {
     // typed `unavailable`, never as a protocol error and never interleaved.
     // Asserted unconditionally — an earlier version only checked inside an
     // `if`, so deleting the lock entirely still passed it green.
-    const results = await Promise.all([
-      client.callTool({ name: 'copperhead_init', arguments: {} }),
-      client.callTool({ name: 'copperhead_init', arguments: {} }),
-    ]);
-    const envs = results.map(envelopeOf);
-    const busy = envs.filter((e) => !e.ok && e.error?.kind === 'unavailable');
-    expect(busy, 'one of two concurrent mutating calls must be refused as busy').toHaveLength(1);
-    expect(busy[0]!.error!.message).toMatch(/in progress/i);
-    expect(envs.filter((e) => e.ok), 'the other must succeed').toHaveLength(1);
+    //
+    // The overlap is made deterministic instead of left to timing. Each call
+    // awaits a `kicad-cli` probe before it tries the lock, and init itself is
+    // quick, so a slow probe let one call acquire, finish and release before
+    // the other arrived; both then succeeded and this test flaked. Holding
+    // every release until both calls have answered keeps the winner's lock
+    // taken for as long as the loser can still reach it.
+    const realRelease = RepoLocks.prototype.release;
+    const held: (() => void)[] = [];
+    const releasedAfterDocs: boolean[] = [];
+    const release = vi
+      .spyOn(RepoLocks.prototype, 'release')
+      .mockImplementation(function (this: RepoLocks, root: string) {
+        // Holding the release must not hide one that comes too early: record
+        // whether the run had already written its docs when it let go.
+        releasedAfterDocs.push(existsSync(path.join(root, 'docs', 'SPEC.md')));
+        held.push(() => realRelease.call(this, root));
+      });
+    try {
+      const results = await Promise.all([
+        client.callTool({ name: 'copperhead_init', arguments: {} }),
+        client.callTool({ name: 'copperhead_init', arguments: {} }),
+      ]);
+      const envs = results.map(envelopeOf);
+      const busy = envs.filter((e) => !e.ok && e.error?.kind === 'unavailable');
+      expect(busy, 'one of two concurrent mutating calls must be refused as busy').toHaveLength(1);
+      expect(busy[0]!.error!.message).toMatch(/in progress/i);
+      expect(envs.filter((e) => e.ok), 'the other must succeed').toHaveLength(1);
+      // Only the holder releases: the refused call returned before taking the lock.
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(releasedAfterDocs, 'the lock must stay held until the run has written its docs').toEqual([true]);
+    } finally {
+      release.mockRestore();
+      for (const run of held.splice(0)) run();
+    }
+    // The held release really frees the repo, so the next mutating call runs.
+    const after = envelopeOf(await client.callTool({ name: 'copperhead_init', arguments: {} }));
+    expect(after.ok, 'the lock must be released once the run is over').toBe(true);
   });
 });
 
