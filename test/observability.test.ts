@@ -334,6 +334,84 @@ describe('liveness heartbeat distinguishes slow from hung (5.1)', () => {
   });
 });
 
+describe('turn watchdog: inactivity deadline + hard cap', () => {
+  /** Reports progress every 20ms (unless `silent`) and finishes after `runMs`,
+   *  or keeps going until closed when `runMs` is null. */
+  class StreamingProvider implements Provider {
+    readonly name = 'scripted';
+    calls = 0;
+    private stops: Array<() => void> = [];
+    constructor(private readonly plan: (call: number) => { runMs: number | null; silent?: boolean }) {}
+    async chat(_m: unknown, _t: unknown, opts?: ChatOpts): Promise<Turn> {
+      const { runMs, silent } = this.plan(++this.calls);
+      return new Promise<Turn>((resolve, reject) => {
+        let chars = 0;
+        const tick = silent ? undefined : setInterval(() => opts?.onStream?.((chars += 100)), 20);
+        const timer =
+          runMs === null
+            ? undefined
+            : setTimeout(() => {
+                clearInterval(tick);
+                resolve(spin('a'));
+              }, runMs);
+        this.stops.push(() => {
+          clearInterval(tick);
+          clearTimeout(timer);
+          reject(new Error('closed'));
+        });
+      });
+    }
+    async close(): Promise<void> {
+      for (const stop of this.stops.splice(0)) stop();
+    }
+  }
+
+  async function runWithConfig(provider: Provider, config: Record<string, number>) {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      await mkdir(path.join(repo, '.copperhead'), { recursive: true });
+      await writeFile(path.join(repo, '.copperhead', 'config.json'), JSON.stringify({ heartbeatMs: 0, ...config }), 'utf8');
+      const lines: string[] = [];
+      const res = await runAgentLoop(loopOpts(repo, provider, lines, { maxTurns: 1, allowDirty: true }));
+      return { res, lines };
+    } finally {
+      await cleanup();
+    }
+  }
+
+  it('lets a turn run past turnTimeoutMs while it keeps streaming progress', async () => {
+    const provider = new StreamingProvider(() => ({ runMs: 300 }));
+    const { lines } = await runWithConfig(provider, { turnTimeoutMs: 100, turnMaxMs: 5000 });
+    expect(provider.calls).toBe(1);
+    expect(lines.some((l) => l.includes('turnTimeoutMs'))).toBe(false);
+  });
+
+  it('still aborts and retries a turn that reports no progress for turnTimeoutMs', async () => {
+    const provider = new StreamingProvider((call) => (call === 1 ? { runMs: null, silent: true } : { runMs: 10 }));
+    const { lines } = await runWithConfig(provider, { turnTimeoutMs: 100, turnMaxMs: 5000 });
+    expect(provider.calls).toBe(2);
+    expect(lines.some((l) => l.includes('retrying (1/3)'))).toBe(true);
+  });
+
+  it('stops a turn still streaming at turnMaxMs and fails without resending it', async () => {
+    const provider = new StreamingProvider(() => ({ runMs: null }));
+    const { res } = await runWithConfig(provider, { turnTimeoutMs: 100, turnMaxMs: 300 });
+    expect(provider.calls).toBe(1);
+    expect(res.outcome).toBe('failure');
+    expect(res.exitPath).toBe('provider-error');
+    expect(res.summary).toContain('too large, not hung');
+  });
+
+  it('fails as provider-error once a silent turn has timed out on every retry', async () => {
+    const provider = new StreamingProvider(() => ({ runMs: null, silent: true }));
+    const { res } = await runWithConfig(provider, { turnTimeoutMs: 50, turnMaxMs: 5000 });
+    expect(provider.calls).toBe(4); // the turn, then MAX_TURN_TIMEOUTS (3) retries
+    expect(res.outcome).toBe('failure');
+    expect(res.exitPath).toBe('provider-error');
+    expect(res.summary).toContain('timed out 4×');
+  });
+});
+
 describe('--json routes progress to stderr (AC-2.4/8.9)', () => {
   it('a --json renderer never writes progress to stdout', () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});

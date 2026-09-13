@@ -149,6 +149,30 @@ describe('create pipeline resilience (review F3)', () => {
     }
   });
 
+  it('hands the failed run reason to the stage diagnosis, not just the exit path', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      const briefPath = await seedRepo(repo);
+      const reason =
+        'a single provider turn was still producing output after 1h00m (turnMaxMs) and was stopped: the turn is too large, not hung';
+      mockRunAgentLoop.mockImplementation(async () => ({
+        ...ok(),
+        outcome: 'failure',
+        exitPath: 'provider-error',
+        summary: reason,
+      }));
+
+      await runCreate({ repoRoot: repo, briefPath, model: 'gpt-5', log: () => {} });
+
+      // The diagnosis transcript excerpt holds only assistant text and tool
+      // results, so the reason has to arrive in the failure string itself.
+      expect(mockDiagnose).toHaveBeenCalledTimes(1);
+      expect(mockDiagnose.mock.calls[0]![1].failure).toBe(`the run ended as "failure" (provider-error): ${reason}`);
+    } finally {
+      await cleanup();
+    }
+  });
+
   it('commitResumedStage commits an already-complete, managed-only dirty tree so a later rollback cannot wipe it', async () => {
     const { repo, cleanup } = await tempFixtureRepo();
     try {

@@ -35,11 +35,16 @@ export interface Turn {
 export interface ChatOpts {
   maxTokens?: number;
   /**
-   * Liveness callback for the loop's heartbeat (5.1). A streaming provider calls
-   * it as output arrives, passing the cumulative streamed-output length in chars,
-   * so a slow turn can be told apart from a hung one. Providers that don't stream
-   * simply never call it (the heartbeat still reports elapsed time). Never used
-   * for billing — real token usage is reported once, on the returned Turn.
+   * Progress callback (5.1). A streaming provider calls it as the turn makes
+   * progress, passing the cumulative streamed-output length in chars. The loop
+   * uses it twice: the heartbeat shows the count, so a slow turn can be told
+   * apart from a hung one, and every call restarts the turn's inactivity
+   * watchdog, so a long turn that keeps producing output is not aborted as hung.
+   * Call it on any progress (thinking, block boundaries), not only new text; an
+   * unchanged count is fine. Providers that don't stream simply never call it
+   * (the heartbeat still reports elapsed time, and the watchdog acts as a
+   * whole-turn deadline). Never used for billing — real token usage is reported
+   * once, on the returned Turn.
    */
   onStream?: (streamedChars: number) => void;
 }

@@ -3,7 +3,7 @@ import { corruptionError } from '../capabilities/helpers.js';
 import { flatten, failResult, seal, unavailable, type ToolResult } from './envelope.js';
 import { registry } from './registry.js';
 import { withRetry, isRateLimit } from '../util/retry.js';
-import { MAX_TURN_TIMEOUTS, TurnTimeoutError, withTimeout } from './recovery.js';
+import { MAX_TURN_TIMEOUTS, TurnTimeoutError, withWatchdog } from './recovery.js';
 import type { RunContext } from './context.js';
 import type { Msg, Provider, Turn } from './types.js';
 
@@ -77,16 +77,26 @@ export async function runSkillSubRun(opts: {
       let timeoutRetries = 0;
       while (true) {
         try {
+          // The main loop's watchdog: streamed progress restarts the idle
+          // deadline, and turnMaxMs caps a turn that keeps streaming.
           res = await withRetry(
-            () => withTimeout(() => provider.chat(messages, tools), ctx.config.turnTimeoutMs, () => provider.close?.()),
+            () =>
+              withWatchdog((activity) => provider.chat(messages, tools, { onStream: () => activity() }), {
+                idleMs: ctx.config.turnTimeoutMs,
+                maxMs: ctx.config.turnMaxMs,
+                onTimeout: () => provider.close?.(),
+              }),
             { isRetryable: isRateLimit, baseMs: 250 },
           );
           break;
         } catch (err) {
-          if (err instanceof TurnTimeoutError && timeoutRetries++ < MAX_TURN_TIMEOUTS) {
+          // Only a hung turn retries: one stopped at the hard cap is too large,
+          // and resending it would only run into the cap again.
+          if (err instanceof TurnTimeoutError && err.kind === 'idle' && timeoutRetries++ < MAX_TURN_TIMEOUTS) {
             await ctx.transcript.event('skill-turn-timeout', {
               skill: skill.name,
-              ms: ctx.config.turnTimeoutMs,
+              kind: err.kind,
+              ms: err.ms,
               attempt: timeoutRetries,
             });
             continue;

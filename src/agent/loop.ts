@@ -5,7 +5,7 @@ import type { Msg, Provider, Turn } from './types.js';
 import { availableTools, dispatchToolResult, type RunContext } from './tools.js';
 import { flatten } from './envelope.js';
 import { CachingProvider } from './response-cache.js';
-import { withTimeout, TurnTimeoutError, MAX_TURN_TIMEOUTS } from './recovery.js';
+import { withWatchdog, TurnTimeoutError, MAX_TURN_TIMEOUTS } from './recovery.js';
 import { buildSystemPrompt } from './prompts.js';
 import { loadConstraints, reopenDeferredAffects } from '../memory/constraints.js';
 import { isCreateProducedRepo, isEngineAuthoredSchematic } from '../kicad/fab.js';
@@ -501,28 +501,54 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
         : null;
     heartbeat?.unref?.();
     try {
+      // Inactivity watchdog plus hard cap: every onStream call is progress and
+      // restarts the idle deadline, so a turn that legitimately runs past
+      // turnTimeoutMs survives while it keeps producing output. A provider that
+      // never streams gets turnTimeoutMs as a whole-turn deadline, as before.
       res = await withRetry(
         () =>
-          withTimeout(
-            () => provider.chat(messages, tools, { onStream: (chars) => (streamedChars = chars) }),
-            config.turnTimeoutMs,
-            () => provider.close?.(),
+          withWatchdog(
+            (activity) =>
+              provider.chat(messages, tools, {
+                onStream: (chars) => {
+                  streamedChars = chars;
+                  activity();
+                },
+              }),
+            { idleMs: config.turnTimeoutMs, maxMs: config.turnMaxMs, onTimeout: () => provider.close?.() },
           ),
         { onRetry: (attempt) => log(`rate limited; retry ${attempt}`) },
       );
     } catch (err) {
+      if (err instanceof TurnTimeoutError && err.kind === 'max') {
+        // Still producing output at the hard cap: the turn is too large, not
+        // hung. Resending the identical request would stream just as long and
+        // hit the cap again, so fail now with a reason that says so; the create
+        // pipeline hands it to the diagnosis, which can split the work.
+        await transcript.event('turn-timeout', { kind: 'max', ms: err.ms, streamedChars });
+        return fail(
+          `a single provider turn was still producing output after ${fmtDuration(err.ms)} (turnMaxMs) and was stopped — ` +
+            'the turn is too large, not hung; split the work into smaller steps, or raise turnMaxMs',
+          'provider-error',
+        );
+      }
       if (err instanceof TurnTimeoutError) {
-        // A hung provider turn: the watchdog aborted the in-flight call and tore
-        // down its subprocess. Retry the same turn a bounded number of times
-        // before giving up, so a transient hang self-heals instead of stalling
-        // the run forever.
+        // A hung provider turn: no response or progress for turnTimeoutMs. The
+        // watchdog aborted the in-flight call and tore down its subprocess.
+        // Retry the same turn a bounded number of times before giving up, so a
+        // transient hang self-heals instead of stalling the run forever.
         if (turnTimeouts++ < maxTurnTimeouts) {
-          log(`turn exceeded ${config.turnTimeoutMs}ms; aborted the hung call and retrying (${turnTimeouts}/${maxTurnTimeouts})`);
-          await transcript.event('turn-timeout', { ms: config.turnTimeoutMs, attempt: turnTimeouts });
+          log(
+            `turn went ${fmtDuration(err.ms)} without a response or progress (turnTimeoutMs); aborted the hung call and retrying (${turnTimeouts}/${maxTurnTimeouts})`,
+          );
+          await transcript.event('turn-timeout', { kind: 'idle', ms: err.ms, attempt: turnTimeouts });
           turn--;
           continue;
         }
-        return fail(`provider turns timed out ${turnTimeouts}× (>${config.turnTimeoutMs}ms each)`, 'provider-error');
+        return fail(
+          `provider turns timed out ${turnTimeouts}× (no response or progress for ${fmtDuration(err.ms)} each)`,
+          'provider-error',
+        );
       }
       if (isRateLimit(err)) {
         const fallback = otherProvider(provider);

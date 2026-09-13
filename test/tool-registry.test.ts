@@ -386,6 +386,80 @@ describe('tool-registry catalog', () => {
     }
   });
 
+  it('a skill turn that keeps streaming outlives turnTimeoutMs', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      await runInit({ repoRoot: repo });
+      const ctx = await makeCtx(repo);
+      ctx.config.turnTimeoutMs = 50;
+      let calls = 0;
+      let finished = false;
+      const skill = defineSkill({
+        schema: { name: 'slow_report', description: 'test', parameters: { type: 'object', properties: {} } },
+        version: 1,
+        viewHint: 'diagnostic',
+        tools: [],
+        maxTurns: 1,
+        prompt: () => '',
+        isComplete: () => finished,
+      });
+      const provider: Provider = {
+        name: 'slow-streaming',
+        chat(_messages, _tools, opts) {
+          calls++;
+          // Streams every 10ms for 200ms: four times the 50ms inactivity limit.
+          return new Promise<Turn>((resolve) => {
+            const tick = setInterval(() => opts?.onStream?.(1), 10);
+            setTimeout(() => {
+              clearInterval(tick);
+              finished = true;
+              resolve({ text: 'done', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1 } });
+            }, 200);
+          });
+        },
+      };
+      const env = await runSkillSubRun({ ctx, skill, args: {}, provider });
+      expect(env.ok).toBe(true);
+      expect(calls).toBe(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('a skill turn still streaming at turnMaxMs fails once, without a retry', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      await runInit({ repoRoot: repo });
+      const ctx = await makeCtx(repo);
+      ctx.config.turnTimeoutMs = 50;
+      ctx.config.turnMaxMs = 150;
+      let calls = 0;
+      const stops: Array<() => void> = [];
+      const provider: Provider = {
+        name: 'endless-streaming',
+        chat(_messages, _tools, opts) {
+          calls++;
+          return new Promise<Turn>((_, reject) => {
+            const tick = setInterval(() => opts?.onStream?.(1), 10);
+            stops.push(() => {
+              clearInterval(tick);
+              reject(new Error('closed'));
+            });
+          });
+        },
+        async close() {
+          for (const stop of stops.splice(0)) stop();
+        },
+      };
+      const env = await dispatchToolResult(ctx, 'generate_report', {}, { provider });
+      expect(env.ok).toBe(false);
+      expect(flatten(env)).toContain('hard cap');
+      expect(calls).toBe(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
   it('an incomplete skill preserves partial results and repeated calls in call order', async () => {
     const { repo, cleanup } = await tempFixtureRepo();
     try {
