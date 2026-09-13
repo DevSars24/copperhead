@@ -286,4 +286,75 @@ describe('CodexProvider', () => {
       'codex login status',
     );
   });
+
+  const initial: Msg[] = [
+    { role: 'system', content: 'system policy' },
+    { role: 'user', content: 'inspect the design' },
+  ];
+  const later: Msg[] = [...initial, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'keep going' }];
+  const okTurn = () => Promise.resolve({ finalResponse: JSON.stringify({ text: 'ok', toolCalls: [] }), usage: null });
+
+  it('close() aborts an in-flight turn, and the retry opens a fresh thread with the full history', async () => {
+    const threads: string[][] = [];
+    let hungSignal: AbortSignal | undefined;
+    const startThread = vi.fn(() => {
+      const prompts: string[] = [];
+      threads.push(prompts);
+      return {
+        run: (input: string, options?: { signal?: AbortSignal }) => {
+          prompts.push(input);
+          // The first thread's second turn hangs like a stuck `codex exec` and
+          // settles only when its signal aborts.
+          if (threads.length === 1 && prompts.length === 2) {
+            hungSignal = options?.signal;
+            return new Promise<never>((_, reject) => {
+              options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+            });
+          }
+          return okTurn();
+        },
+      };
+    });
+    const provider = new CodexProvider({ workingDirectory: process.cwd(), client: { startThread } });
+    await provider.chat(initial, [readTool]);
+
+    const stuck = provider.chat(later, [readTool]);
+    await vi.waitFor(() => expect(hungSignal).toBeDefined());
+    await provider.close();
+    expect(hungSignal!.aborted).toBe(true);
+    await expect(stuck).rejects.toThrow('aborted');
+
+    await provider.chat(later, [readTool]);
+    expect(startThread).toHaveBeenCalledTimes(2);
+    // Without the cursor reset the fresh thread would receive only "keep going".
+    expect(threads[1]![0]).toContain('system policy');
+    expect(threads[1]![0]).toContain('inspect the design');
+    expect(threads[1]![0]).toContain('keep going');
+  });
+
+  it('discards a turn that settles after close(), so it cannot move the fresh thread cursor', async () => {
+    const prompts: string[] = [];
+    let release: (() => void) | undefined;
+    const run = (input: string) => {
+      prompts.push(input);
+      // The second turn ignores its signal and settles late, after close().
+      if (prompts.length === 2) {
+        return new Promise<{ finalResponse: string; usage: null }>((resolve) => {
+          release = () => resolve({ finalResponse: JSON.stringify({ text: 'late', toolCalls: [] }), usage: null });
+        });
+      }
+      return okTurn();
+    };
+    const provider = new CodexProvider({ workingDirectory: process.cwd(), client: { startThread: () => ({ run }) } });
+    await provider.chat(initial, [readTool]);
+
+    const late = provider.chat(later, [readTool]);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    await provider.close();
+    release!();
+    await expect(late).rejects.toThrow('closed');
+
+    await provider.chat(later, [readTool]);
+    expect(prompts[2]).toContain('system policy');
+  });
 });
