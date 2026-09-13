@@ -114,6 +114,43 @@ describe('withWatchdog (inactivity deadline + hard cap)', () => {
     expect(err).toBeInstanceOf(TurnTimeoutError);
   });
 
+  it('never caps a call that has reported no progress: its idle deadline alone applies', async () => {
+    const err = await withWatchdog(hang, { idleMs: 200, maxMs: 100 }).catch((e: unknown) => e);
+    expect((err as TurnTimeoutError).kind).toBe('idle');
+    expect((err as TurnTimeoutError).ms).toBe(200);
+  });
+
+  it('with the idle deadline off, does not cap a call that stays silent', async () => {
+    const quiet = () => new Promise<string>((resolve) => setTimeout(() => resolve('done'), 250));
+    expect(await withWatchdog(quiet, { idleMs: 0, maxMs: 100 })).toBe('done');
+  });
+
+  it('trips the cap as soon as progress arrives after the cap has come due', async () => {
+    let progressed = false;
+    const lateStarter = (activity: () => void) => {
+      setTimeout(() => {
+        progressed = true;
+        activity();
+      }, 150);
+      return hang();
+    };
+    const err = await withWatchdog(lateStarter, { idleMs: 0, maxMs: 50 }).catch((e: unknown) => e);
+    expect((err as TurnTimeoutError).kind).toBe('max');
+    expect(progressed, 'the cap waited for the first progress rather than firing at 50 ms').toBe(true);
+  });
+
+  it('never caps a streaming call below its idle deadline', async () => {
+    let tick: ReturnType<typeof setInterval> | undefined;
+    const streams = (activity: () => void) => {
+      tick = setInterval(activity, 10);
+      return hang();
+    };
+    const err = await withWatchdog(streams, { idleMs: 150, maxMs: 50 }).catch((e: unknown) => e);
+    clearInterval(tick);
+    expect((err as TurnTimeoutError).kind).toBe('max');
+    expect((err as TurnTimeoutError).ms).toBe(150);
+  });
+
   it('disables both limits when <= 0', async () => {
     expect(await withWatchdog(async () => 'ok', { idleMs: 0, maxMs: 0 })).toBe('ok');
   });

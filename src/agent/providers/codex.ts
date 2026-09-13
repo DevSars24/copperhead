@@ -142,9 +142,13 @@ export class CodexProvider implements Provider {
     // thread being discarded; otherwise a retried turn runs without context.
     this.thread = null;
     this.messageCursor = 0;
-    if (this.ownsWorkingDirectory && this.workingDirectory) {
-      await rm(this.workingDirectory, { recursive: true, force: true });
+    // Forget the directory before deleting it: the watchdog does not await
+    // close(), so a retried turn can start while rm is still running, and it must
+    // create a fresh directory rather than reuse the one being deleted.
+    const dir = this.workingDirectory;
+    if (this.ownsWorkingDirectory && dir) {
       this.workingDirectory = null;
+      await rm(dir, { recursive: true, force: true });
     }
   }
 

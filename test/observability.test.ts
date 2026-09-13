@@ -401,6 +401,15 @@ describe('turn watchdog: inactivity deadline + hard cap', () => {
     expect(res.exitPath).toBe('provider-error');
     expect(res.summary).toContain('too large, not hung');
   });
+
+  it('fails as provider-error once a silent turn has timed out on every retry', async () => {
+    const provider = new StreamingProvider(() => ({ runMs: null, silent: true }));
+    const { res } = await runWithConfig(provider, { turnTimeoutMs: 50, turnMaxMs: 5000 });
+    expect(provider.calls).toBe(4); // the turn, then MAX_TURN_TIMEOUTS (3) retries
+    expect(res.outcome).toBe('failure');
+    expect(res.exitPath).toBe('provider-error');
+    expect(res.summary).toContain('timed out 4×');
+  });
 });
 
 describe('--json routes progress to stderr (AC-2.4/8.9)', () => {

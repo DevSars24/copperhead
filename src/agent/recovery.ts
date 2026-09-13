@@ -47,8 +47,12 @@ export async function withTimeout<T>(
  * output is never mistaken for a hung one, while a call that reports nothing gets
  * `idleMs` as a plain whole-call deadline (unchanged for providers that cannot
  * stream). `maxMs` is a hard cap activity does not extend, so a turn that streams
- * forever still ends. `<= 0` (or non-finite) disables either limit; with both
- * disabled this just awaits `fn`.
+ * forever still ends. The cap bounds a call that is producing output, so it only
+ * trips once `fn` has reported progress (a silent call is judged by `idleMs`
+ * alone, exactly as before the cap existed), and it is never shorter than
+ * `idleMs` (a lower cap would cut off a turn the idle deadline alone allows).
+ * `<= 0` (or non-finite) disables either limit; with both disabled this just
+ * awaits `fn`.
  */
 export async function withWatchdog<T>(
   fn: (activity: () => void) => Promise<T>,
@@ -58,11 +62,16 @@ export async function withWatchdog<T>(
   const maxMs = opts.maxMs ?? 0;
   const maxOn = Number.isFinite(maxMs) && maxMs > 0;
   if (!idleOn && !maxOn) return fn(() => {});
+  const capMs = idleOn ? Math.max(maxMs, opts.idleMs) : maxMs;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let maxTimer: ReturnType<typeof setTimeout> | undefined;
   // Set once the race is decided either way, so a late activity() from an
   // abandoned call cannot re-arm a timer after the watchdog is done.
   let settled = false;
+  // Whether fn has reported progress yet, and whether the cap came due while it
+  // had not (see the cap timer below).
+  let progressed = false;
+  let capPassed = false;
   let trip!: (err: TurnTimeoutError) => void;
   const timeout = new Promise<never>((_, reject) => {
     trip = (err) => {
@@ -77,13 +86,26 @@ export async function withWatchdog<T>(
       void Promise.resolve(opts.onTimeout?.()).catch(() => {});
     };
   });
-  const activity = (): void => {
-    if (!idleOn || settled) return;
+  const armIdle = (): void => {
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => trip(new TurnTimeoutError(opts.idleMs, 'idle')), opts.idleMs);
   };
-  activity();
-  if (maxOn) maxTimer = setTimeout(() => trip(new TurnTimeoutError(maxMs, 'max')), maxMs);
+  const activity = (): void => {
+    if (settled) return;
+    progressed = true;
+    if (capPassed) return trip(new TurnTimeoutError(capMs, 'max'));
+    if (idleOn) armIdle();
+  };
+  if (idleOn) armIdle();
+  if (maxOn) {
+    maxTimer = setTimeout(() => {
+      // The cap bounds a turn that is producing output. A call that has reported
+      // nothing yet stays under the idle deadline alone; if it starts reporting
+      // progress later, the cap applies at that moment.
+      if (progressed) trip(new TurnTimeoutError(capMs, 'max'));
+      else capPassed = true;
+    }, capMs);
+  }
   try {
     return await Promise.race([fn(activity), timeout]);
   } finally {

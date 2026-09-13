@@ -42,10 +42,12 @@ export interface CopperheadConfig {
    * output is not killed; a provider that reports no progress gets it as a
    * whole-turn deadline. <=0 disables it. */
   turnTimeoutMs: number;
-  /** Hard cap (ms) on one provider turn, however much progress it reports. A
-   * turn that hits it is too large, not hung, so it fails without a retry:
-   * resending the identical request would only run into the cap again.
-   * <=0 disables it. */
+  /** Hard cap (ms) on one provider turn that is producing output, however much
+   * progress it reports. A turn that hits it is too large, not hung, so it fails
+   * without a retry: resending the identical request would only run into the cap
+   * again. It is never shorter than turnTimeoutMs, and a turn that has reported
+   * no progress is judged by turnTimeoutMs alone. <=0 disables it; when unset it
+   * defaults to 3600000, or to disabled when turnTimeoutMs is disabled. */
   turnMaxMs: number;
   /** How often (ms) to emit a liveness heartbeat while a provider turn is in
    * flight, so a slow large-output turn is distinguishable from a hung one
@@ -132,7 +134,15 @@ export async function loadConfig(repoRoot: string): Promise<CopperheadConfig> {
     maxRepairCycles: raw.maxRepairCycles ?? DEFAULTS.maxRepairCycles,
     budgets: raw.budgets ?? {},
     turnTimeoutMs: typeof raw.turnTimeoutMs === 'number' ? raw.turnTimeoutMs : DEFAULTS.turnTimeoutMs,
-    turnMaxMs: typeof raw.turnMaxMs === 'number' ? raw.turnMaxMs : DEFAULTS.turnMaxMs,
+    // A repo that switched the turn watchdog off gets no default cap either:
+    // before the cap existed that meant no deadline at all, and a default must
+    // not quietly bring one back. An explicit turnMaxMs still applies.
+    turnMaxMs:
+      typeof raw.turnMaxMs === 'number'
+        ? raw.turnMaxMs
+        : typeof raw.turnTimeoutMs === 'number' && raw.turnTimeoutMs <= 0
+          ? 0
+          : DEFAULTS.turnMaxMs,
     heartbeatMs: typeof raw.heartbeatMs === 'number' ? raw.heartbeatMs : DEFAULTS.heartbeatMs,
     maxStageRetries:
       Number.isInteger(raw.maxStageRetries) && (raw.maxStageRetries as number) >= 0

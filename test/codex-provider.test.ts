@@ -357,4 +357,25 @@ describe('CodexProvider', () => {
     await provider.chat(later, [readTool]);
     expect(prompts[2]).toContain('system policy');
   });
+
+  it('a turn retried while close() is still deleting the old directory gets a fresh one', async () => {
+    const dirs: string[] = [];
+    const startThread = vi.fn((options?: { workingDirectory?: string }) => {
+      dirs.push(options?.workingDirectory ?? '');
+      return { run: () => okTurn() };
+    });
+    // No workingDirectory: the provider owns a temporary one, as in production.
+    const provider = new CodexProvider({ client: { startThread } });
+    await provider.chat(initial, [readTool]);
+
+    // The watchdog does not await close(), so the loop can retry before rm finishes.
+    const closing = provider.close();
+    const retry = provider.chat(initial, [readTool]);
+    await Promise.all([closing, retry]);
+
+    expect(dirs).toHaveLength(2);
+    expect(dirs[1]).not.toBe(dirs[0]);
+    await expect(access(dirs[1]!)).resolves.toBeUndefined();
+    await provider.close();
+  });
 });

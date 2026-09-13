@@ -17,8 +17,7 @@ import { tempFixtureRepo } from './helpers.js';
  */
 
 const MIN = 60_000;
-/** Simulated time added per event-loop spin. Real I/O inside a turn spans some
- *  spins, so a small step keeps the fake clock from racing ahead of it. */
+/** Simulated time added per clock step while the fake subprocess waits (see `simulate`). */
 const STEP_MS = 250;
 
 interface SubprocessLog {
@@ -47,16 +46,22 @@ function streamingFor(minutes: number): Step[] {
   return steps;
 }
 
+/** Fake sleeps currently waiting on the simulated clock (see `simulate`). */
+let pendingSleeps = 0;
+
 /** Wait `ms` of simulated time, rejecting like the SDK if `signal` aborts first. */
 function sleep(ms: number, signal: AbortSignal | undefined, onAbort: () => void): Promise<void> {
+  pendingSleeps++;
   return new Promise((resolve, reject) => {
     const abort = () => {
       clearTimeout(timer);
+      pendingSleeps--;
       onAbort();
       reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
     };
     const timer = setTimeout(() => {
       signal?.removeEventListener('abort', abort);
+      pendingSleeps--;
       resolve();
     }, ms);
     if (signal?.aborted) abort();
@@ -78,20 +83,27 @@ function fakeClaudeSubprocess(script: (call: number) => Step[], log: SubprocessL
   };
 }
 
-/** Run `start()` under fake timers, advancing the clock STEP_MS at a time and
- *  yielding to real I/O between steps, until it settles. */
+/** Run `start()` under fake timers until it settles. The clock moves, STEP_MS at a
+ *  time, only while the fake subprocess is waiting on its schedule. The rest of
+ *  the time the run is doing real I/O (git, the transcript, the provider's scratch
+ *  cwd), and advancing the clock then would spend simulated time on it, making the
+ *  result depend on how fast that I/O is. */
 async function simulate<T>(start: () => Promise<T>, maxSimulatedMs = 3 * 60 * MIN): Promise<T> {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+  pendingSleeps = 0;
   try {
     let done = false;
     const run = start().finally(() => {
       done = true;
     });
     run.catch(() => {}); // surfaced by the await below, not as an unhandled rejection
-    for (let simulated = 0; !done; simulated += STEP_MS) {
-      if (simulated > maxSimulatedMs) throw new Error(`still running after ${maxSimulatedMs}ms of simulated time`);
+    let simulated = 0;
+    while (!done) {
       await new Promise((r) => setImmediate(r));
+      if (pendingSleeps === 0) continue;
+      if (simulated > maxSimulatedMs) throw new Error(`still running after ${maxSimulatedMs}ms of simulated time`);
       await vi.advanceTimersByTimeAsync(STEP_MS);
+      simulated += STEP_MS;
     }
     return await run;
   } finally {

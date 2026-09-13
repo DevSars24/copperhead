@@ -101,8 +101,8 @@ A skill invocation SHALL run a nested turn loop that shares the parent's ledger,
 - **THEN** dispatch returns an envelope with `ok: false` and `error.kind: exception`, rather than letting the rejection escape the parent loop
 
 #### Scenario: Nested provider recovery is bounded
-- **WHEN** a nested provider turn returns 429 or exceeds `turnTimeoutMs`
-- **THEN** the sub-run applies bounded backoff or timeout retries using the main loop policy and eventually returns or fails as one envelope
+- **WHEN** a nested provider turn returns 429, goes `turnTimeoutMs` without a response or streamed progress, or is still running at `turnMaxMs`
+- **THEN** the sub-run applies bounded backoff or timeout retries using the main loop policy (a turn stopped at `turnMaxMs` is not retried) and eventually returns or fails as one envelope
 
 #### Scenario: Partial and repeated results survive
 - **WHEN** a skill exhausts its turn budget after calling the same tool more than once
