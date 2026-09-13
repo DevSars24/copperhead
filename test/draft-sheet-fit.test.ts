@@ -244,10 +244,22 @@ describe('the IC leads its group', () => {
     // inputs still enter from the left: a connector stays at depth 0
     const { model } = await draftBoard('usb-atmega-node');
     const at = (ref: string) => model.symbols.find((s) => s.ref === ref)!.at;
-    // never to the right: a column-major wrap may stack a group under the
-    // jack's group, which puts the two at one x
-    expect(at('J1').x).toBeLessThanOrEqual(at('U2').x); // Power Input's USB jack, Regulation's LDO
-    expect(at('J1').x).toBeLessThanOrEqual(at('U1').x); // and the MCU
+    // never to the right, and strictly left of an IC in another column: a
+    // column-major wrap may stack a group under the jack's group, which puts
+    // the two at one x
+    const boxOf = (ref: string) => {
+      const p = at(ref);
+      const r = model.rectangles.find((b) => p.x >= Math.min(b.x1, b.x2) && p.x <= Math.max(b.x1, b.x2) && p.y >= Math.min(b.y1, b.y2) && p.y <= Math.max(b.y1, b.y2));
+      expect(r, `${ref} in no group box`).toBeDefined();
+      return r!;
+    };
+    const leftOf = (ref: string): number => Math.min(boxOf(ref).x1, boxOf(ref).x2);
+    // Power Input's USB jack against Regulation's LDO (stacked under it) and the MCU (the next column)
+    for (const ic of ['U2', 'U1']) {
+      if (Math.abs(leftOf('J1') - leftOf(ic)) < 0.01) expect(at('J1').x, ic).toBeLessThanOrEqual(at(ic).x);
+      else expect(at('J1').x, ic).toBeLessThan(at(ic).x);
+    }
+    expect(Math.abs(leftOf('J1') - leftOf('U1'))).toBeGreaterThan(0.01); // the strict case is exercised
   });
 });
 
@@ -476,13 +488,43 @@ describe('reference boards pass the sheet-fit gate', () => {
 });
 
 describe('the squeeze: cells sized from what they drew', () => {
-  it('reports its rounds and never grows the group boxes', async () => {
-    const { report } = await place(mcusWithBank(4, 24));
-    expect(report.sheetFit.squeeze).toBeDefined();
-    const sq = report.sheetFit.squeeze!;
-    expect(sq.boxAreaAfter).toBeLessThanOrEqual(sq.boxAreaBefore);
-    if (sq.rounds > 0) expect(report.notes.some((n) => /^cells measured:/.test(n))).toBe(true);
-    else expect(report.notes.some((n) => /^cells measured:/.test(n))).toBe(false);
+  it('drafts no rounds unless asked, and reports the measurement anyway', async () => {
+    const was = process.env['COPPERHEAD_DRAFT_SQUEEZE'];
+    delete process.env['COPPERHEAD_DRAFT_SQUEEZE'];
+    try {
+      const { report } = await place(mcusWithBank(4, 24));
+      const sq = report.sheetFit.squeeze!;
+      expect(sq).toBeDefined();
+      expect(sq.rounds).toBe(0);
+      expect(sq.boxAreaAfter).toBe(sq.boxAreaBefore);
+      expect(report.notes.some((n) => /^cells measured:/.test(n))).toBe(false);
+    } finally {
+      if (was !== undefined) process.env['COPPERHEAD_DRAFT_SQUEEZE'] = was;
+    }
+  });
+
+  it('keeps a round that shrinks the boxes when COPPERHEAD_DRAFT_SQUEEZE=1 asks for rounds (AC-16.53)', async () => {
+    // ldo-demo's cells are sized well past what they draw: measured rounds
+    // take its group boxes from about 5.8 k to 5.3 k mm² on the same sheet
+    const was = process.env['COPPERHEAD_DRAFT_SQUEEZE'];
+    process.env['COPPERHEAD_DRAFT_SQUEEZE'] = '1';
+    const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-squeeze-'));
+    try {
+      await cp(path.join(CONTROL, 'ldo-demo'), repo, { recursive: true });
+      const intent = JSON.parse(await readFile(path.join(repo, 'schematic.intent.json'), 'utf8')) as SchematicIntent;
+      const v = await validateIntent(intent, new SymbolSource(repo, []), path.join(repo, 'docs'));
+      expect(v.ok, v.findings.map((f) => f.detail).join('; ')).toBe(true);
+      const { report } = draftSchematicPlacement(v.validated!, 'board', '2020-01-01');
+      const sq = report.sheetFit.squeeze!;
+      expect(sq.rounds).toBeGreaterThanOrEqual(1);
+      expect(sq.boxAreaAfter).toBeLessThan(sq.boxAreaBefore);
+      expect(report.notes.some((n) => /^cells measured:/.test(n)), report.notes.join('; ')).toBe(true);
+      expect(report.mergedNets).toEqual([]);
+    } finally {
+      if (was === undefined) delete process.env['COPPERHEAD_DRAFT_SQUEEZE'];
+      else process.env['COPPERHEAD_DRAFT_SQUEEZE'] = was;
+      await rm(repo, { recursive: true, force: true });
+    }
   });
 });
 
@@ -509,11 +551,45 @@ function sevenGroups(): SchematicIntent {
   return { version: 1, parts, nets: nets.filter((x, i, all) => x.name !== 'GND' || all.findIndex((y) => y.name === 'GND') === i), noConnect };
 }
 
+/** `count` groups of stacked MCUs at the engagement sheet's mixed heights, repeated. */
+function groupsOf(count: number): SchematicIntent {
+  const heights = [6, 2, 7, 3, 3, 5, 3];
+  const parts = [];
+  const noConnect: string[] = [];
+  const nets: { name: string; pins: string[] }[] = [];
+  const gnd: string[] = [];
+  let n = 0;
+  for (let g = 0; g < count; g++) {
+    const refs: string[] = [];
+    for (let i = 0; i < heights[g % heights.length]!; i++) {
+      n++;
+      parts.push({ ref: `U${n}`, libId: 'CopperMCU:MCU8', value: 'MCU8', group: `G${g + 1}` });
+      for (const p of ['3', '4', '5', '6', '7', '8']) noConnect.push(`U${n}.${p}`);
+      refs.push(`U${n}`);
+    }
+    nets.push({ name: `VCC${g + 1}`, pins: refs.map((r) => `${r}.1`) });
+    gnd.push(...refs.map((r) => `${r}.2`));
+  }
+  nets.push({ name: 'GND', pins: gnd });
+  return { version: 1, parts, nets, noConnect };
+}
+
+/** The wrap note's count is the number of lines the drawn boxes stand on:
+ * a row's boxes share a top, a column's a left (AC-16.64). */
+function expectWrapNoteMatchesBoxes(model: { rectangles: { x1: number; y1: number; x2: number; y2: number }[] }, report: { notes: string[] }) {
+  const m = report.notes.map((n) => /wrapped onto (\d+) (rows|columns)|laid in (\d+) columns/.exec(n)).find((x) => x !== null);
+  expect(m, report.notes.join('; ')).toBeDefined();
+  const named = Number(m![1] ?? m![3]);
+  const byRows = m![2] === 'rows';
+  const lines = new Set(model.rectangles.map((r) => Math.round((byRows ? Math.min(r.y1, r.y2) : Math.min(r.x1, r.x2)) * 100))).size;
+  expect(lines, report.notes.join('; ')).toBe(named);
+}
+
 describe('the look: a wrapped sheet is fitted again on measured label reach (AC-16.63)', () => {
   it('records the look on a wrapped sheet and never keeps a larger sheet or a worse draft', async () => {
     const { model, report } = await place(sevenGroups());
     const wrapped = report.notes.some((n) => /wrapped onto|laid in \d+ columns/.test(n));
-    if (!wrapped) return;
+    expect(wrapped, report.notes.join('; ')).toBe(true);
     expect(report.sheetFit.look).toBeDefined();
     const look = report.sheetFit.look!;
     const idx = (p: string): number => Object.keys(PAPER_DIMS).indexOf(p);
@@ -540,9 +616,34 @@ describe('masonry wrap: groups dealt to columns that each stack their own (AC-16
         expect(ox <= 0.01 || oy <= 0.01).toBe(true);
       }
     }
-    // the fit shape is named in the notes when the groups wrapped
-    if (report.notes.some((n) => /laid in \d+ columns/.test(n))) {
-      expect(report.notes.some((n) => /each column stacks its own groups/.test(n))).toBe(true);
+    // the fit names its shape, and the count it names is the count drawn
+    expectWrapNoteMatchesBoxes(model, report);
+  });
+
+  it('names the number of columns the boxes are drawn in, not the number of groups (AC-16.49)', async () => {
+    // usb-atmega-node wraps column-major: six groups in three columns. The
+    // note counted distinct shifts, and every group's shift differs.
+    const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-wrapnote-'));
+    try {
+      await cp(path.join(CONTROL, 'usb-atmega-node'), repo, { recursive: true });
+      const intent = JSON.parse(await readFile(path.join(repo, 'schematic.intent.json'), 'utf8')) as SchematicIntent;
+      const v = await validateIntent(intent, new SymbolSource(repo, []), path.join(repo, 'docs'));
+      expect(v.ok, v.findings.map((f) => f.detail).join('; ')).toBe(true);
+      const { model, report } = draftSchematicPlacement(v.validated!, 'usb-atmega-node', '2020-01-01');
+      expect(report.notes.some((n) => /wrapped onto 3 columns/.test(n)), report.notes.join('; ')).toBe(true);
+      expectWrapNoteMatchesBoxes(model, report);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
     }
   });
+
+  it('drafts twelve groups in seconds: the deal search cuts branches that cannot win', async () => {
+    // enumerating every deal at every budget of every sheet took twelve groups
+    // to about nineteen seconds here, and past the sixty-second test budgets
+    // on a slower machine
+    const t0 = performance.now();
+    const { model } = await place(groupsOf(12));
+    expect(performance.now() - t0).toBeLessThan(10_000);
+    expectInsideFrame(model);
+  }, 60000);
 });

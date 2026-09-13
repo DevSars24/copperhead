@@ -2286,7 +2286,7 @@
 		(property "Reference" "#PWR06" (at 191.77 130.81 0)
 			(effects (font (size 1.27 1.27)) hide)
 		)
-		(property "Value" "+5V" (at 196.85 125.984 0)
+		(property "Value" "+5V" (at 196.85 117.094 0)
 			(effects (font (size 1.27 1.27)))
 		)
 		(property "Footprint" "" (at 196.85 129.54 0)

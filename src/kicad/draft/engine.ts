@@ -45,8 +45,13 @@ const ROW_GAP = 3;
 const CHANNEL = 4;
 /** Gap between group boxes, units. */
 const GROUP_GAP = 4;
-/** Local nets up to this many endpoints may be wired (design D2). */
+/** Local nets up to this many endpoints may be wired (design D2); a larger
+ * cluster is narrowed to the endpoints bound to one anchor before routing. */
 const MAX_WIRED_ENDPOINTS = 4;
+/** Subsets of one cluster the wire pass tries to route before it gives up. */
+const ROUTE_ATTEMPTS = 64;
+/** Nodes the masonry wrap's deal search visits before it keeps the best deal found so far. */
+const MASONRY_NODE_BUDGET = 200_000;
 /** Wire-span budget in mm beyond which a net becomes labels. */
 const MAX_WIRE_SPAN = 50.8;
 /** Label text metrics, matching the legibility checker's conservative box. */
@@ -73,7 +78,7 @@ const padBox = (b: Bounds, p = TEXT_PAD): Bounds => ({ minX: b.minX - p, minY: b
 /** `COPPERHEAD_DRAFT_TRACE=1` prints every placement decision the engine
  * makes silently: what it claimed, what it skipped and why, what it refused. */
 const trace = (msg: string): void => {
-  if (process.env['COPPERHEAD_DRAFT_TRACE']) console.error(`[draft] ${msg}`);
+  if (process.env['COPPERHEAD_DRAFT_TRACE'] === '1') console.error(`[draft] ${msg}`);
 };
 /** `labelTextBox` at the reserve advance: what the text takes on paper. */
 const labelReserveBox = (name: string, x: number, y: number, rot: number, kind: EmitLabel['kind'] = 'local'): Bounds =>
@@ -192,6 +197,8 @@ const PAPERS: { name: string; w: number; h: number }[] = [
 ];
 const FRAME = 10;
 const TITLE_STRIP = 30;
+/** The title block's width along the bottom edge, as the checker measures it. */
+const TITLE_BLOCK_W = 110;
 /** Max pin-to-pin gap, grid units, for chaining a passive bank on one trunk
  * (#233): wide enough for two-pin parts sitting in adjacent COLUMNS (cell
  * width plus the channel, ~23 units), tight enough that a trunk never spans
@@ -762,6 +769,7 @@ export function draftSchematicPlacement(validated: ValidatedIntent, projectName:
   for (let round = 0; round < 16; round++) {
     const { model, report, rects, measured: nextMeasured, reach, wrapped } = draftOnce(validated, projectName, today, reserves, frameSlack, measured, wrapGap, reachMeasured);
     let widened = false;
+    const stillWrong: string[] = [];
     // A row or column wrapped to the full usable width leaves no room for the
     // text its boxes grow to hold afterwards, and a box then crosses the
     // frame (usb-atmega-node's IO Headers on A3). Any box past the frame
@@ -772,7 +780,21 @@ export function draftSchematicPlacement(validated: ValidatedIntent, projectName:
       if (over > 0.01) {
         frameSlack += over + U;
         widened = true;
+        stillWrong.push(`a box crosses the frame by ${over.toFixed(1)} mm`);
         trace(`a group box crosses the frame by ${over.toFixed(2)} mm; the usable frame shrinks by ${frameSlack.toFixed(2)} mm and the sheet is drafted again`);
+      }
+      // A sheet fitted into the title strip was judged on its group rects
+      // before the boxes grew to their text; a box that grew into the title
+      // block's own corner (as the checker reserves it, narrowed on small
+      // pages) overflows the usable height by how far it reaches in.
+      const cornerX = paper.w - FRAME - Math.min(TITLE_BLOCK_W, (paper.w - 2 * FRAME) / 2);
+      const cornerY = paper.h - FRAME - Math.min(TITLE_STRIP, (paper.h - 2 * FRAME) / 4);
+      const into = Math.max(0, ...rects.map((r) => (r.x2 > cornerX + 0.01 && r.y2 > cornerY + 0.01 ? r.y2 - cornerY : 0)));
+      if (over <= 0.01 && into > 0.01) {
+        frameSlack += into + U;
+        widened = true;
+        stillWrong.push(`a box enters the title block's corner by ${into.toFixed(1)} mm`);
+        trace(`a group box enters the title block's corner by ${into.toFixed(2)} mm; the usable frame shrinks by ${frameSlack.toFixed(2)} mm and the sheet is drafted again`);
       }
     }
     for (let i = 0; i < rects.length; i++) {
@@ -783,6 +805,7 @@ export function draftSchematicPlacement(validated: ValidatedIntent, projectName:
         const oy = Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1);
         if (ox <= 0.01 || oy <= 0.01) continue;
         widened = true;
+        stillWrong.push(`"${a.name}" and "${b.name}" intersect`);
         if (oy < ox) {
           // boxes in different rows (or columns) touching along the wrap
           // gap: widen the gap between wrapped rows and columns
@@ -808,6 +831,7 @@ export function draftSchematicPlacement(validated: ValidatedIntent, projectName:
     // re-tilings is not a sheet to keep; nor one that lost a hung part, or
     // needs a larger sheet, or shrank by less than three percent
     const passes = !widened && report.mergedNets.length === 0 && !report.labelOverlapBudgetExceeded;
+    if (widened) report.notes.push(`group boxes still wrong after ${retries} re-tilings (${stillWrong.join('; ')}); the sheet is drawn as it stands`);
     retries = 0;
     reserves.clear();
     frameSlack = 0;
@@ -1924,8 +1948,8 @@ function draftOnce(
       // from 364 × 150 to the width of its neighbours).
       // A group with no IC to lead it (buttons, test points, LEDs) has no
       // natural shape, and its columns line up as a strip five blocks wide;
-      // shape it no wider than twice its square side, the grid a person
-      // draws. Groups led by an IC keep the IC's own proportions.
+      // shape it no wider than two and a half times its square side, the grid
+      // a person draws. Groups led by an IC keep the IC's own proportions.
       const shapeToAspect = anchors.length === 0;
       const aspectBand = Math.ceil(2.5 * squareSide);
       const searchBand = shapeToAspect ? Math.min(aspectBand, bandW) : bandW;
@@ -2179,17 +2203,19 @@ function draftOnce(
         let capX = groupX;
         let capY = groupMaxY + MARGIN + 4;
         let bankRowH = 2 * MARGIN + 6;
+        // A bank member with horizontal leads (a TVS diode drawn lying down)
+        // stands up like the caps beside it, its rail lead on top; lying in
+        // the row it carried its ground symbol sideways under the next cap's
+        // name. Each member is turned, and measured, by its own leads.
+        const bankRotOf = (ref: string): number => {
+          const inst = instByKey.get(ref)!;
+          if (inst.sym.pins.length !== 2 || !inst.sym.pins.every((p) => outward(p).dx !== 0)) return 0;
+          const railPin = inst.sym.pins.find((p) => (netClasses.get(netByEndpoint.get(`${inst.ref}.${p.number}`)?.name ?? '')?.cls ?? 'signal') === 'rail') ?? inst.sym.pins[0]!;
+          return orientFor(ref, railPin.number, { dx: 0, dy: -1 }) ?? 90;
+        };
         for (const ref of capRefs) {
           const inst = instByKey.get(ref)!;
-          // A bank member with horizontal leads (a TVS diode drawn lying down)
-          // stands up like the caps beside it, its rail lead on top; lying in
-          // the row it carried its ground symbol sideways under the next
-          // cap's name.
-          let rot = 0;
-          if (inst.sym.pins.length === 2 && inst.sym.pins.every((p) => outward(p).dx !== 0)) {
-            const railPin = inst.sym.pins.find((p) => (netClasses.get(netByEndpoint.get(`${inst.ref}.${p.number}`)?.name ?? '')?.cls ?? 'signal') === 'rail') ?? inst.sym.pins[0]!;
-            rot = orientFor(ref, railPin.number, { dx: 0, dy: -1 }) ?? 90;
-          }
+          const rot = bankRotOf(ref);
           const sym = rotatedSym(inst.sym, rot);
           const b = bodyBoundsOf(sym);
           // a measured cap takes the room its drawing needed (its own fields,
@@ -2209,7 +2235,7 @@ function draftOnce(
           let railRunW = 0;
           if (railStart) {
             for (let k = capRefs.indexOf(ref); k < capRefs.length && railOf(capRefs[k]!) === railOf(ref); k++) {
-              const kb = bodyBoundsOf(rotatedSym(instByKey.get(capRefs[k]!)!.sym, rot));
+              const kb = bodyBoundsOf(rotatedSym(instByKey.get(capRefs[k]!)!.sym, bankRotOf(capRefs[k]!)));
               const km = measured?.get(capRefs[k]!);
               railRunW += km ? ceilU(km.left) + ceilU(kb.maxX - kb.minX) + ceilU(km.right) + 2 * MEASURE_PAD : ceilU(kb.maxX - kb.minX) + 2 * MARGIN;
             }
@@ -2712,20 +2738,27 @@ function draftOnce(
         // on Q1's drain, which faces up): turn every part half a turn so the
         // lead that meets the anchor is the bottom one, and stack upward.
         // The reverse case (an anchor above, met by a bottom lead) mirrors it.
+        // A turned chain that is then abandoned below gets its column's
+        // orientation back: `abandon` restores every part the turn replaced.
+        const unturned = new Map<string, Placed>();
         const flip = (): void => {
           for (const key of chain) {
             const pl = placed.get(key)!;
-            placed.set(key, placeCell(key, pl.x, pl.y, (pl.rot + 180) % 360));
+            unturned.set(key, pl);
+            placed.set(key, placeCell(key, pl.x, pl.y, (pl.rot + 180) % 360, pl.mirror));
           }
           [topEnd, bottomEnd] = [bottomEnd, topEnd];
           chain.reverse();
         };
-        if (topEnd.kind === 'anchor' && outward(topEnd.pin).dy === -1 && bottomEnd.kind !== 'anchor') flip();
-        else if (bottomEnd.kind === 'anchor' && outward(bottomEnd.pin).dy === 1 && topEnd.kind !== 'anchor') flip();
+        const abandon = (): void => {
+          for (const [key, pl] of unturned) placed.set(key, pl);
+        };
         if (chain.length > 4) continue; // beyond four parts this is a network, not an idiom
         const anchors = [topEnd, bottomEnd].filter((e): e is Extract<ChainEnd, { kind: 'anchor' }> => e.kind === 'anchor');
         if (anchors.length === 0 && chain.length < 2) continue; // a lone floating part has nothing to align to
         if (topEnd.kind === 'open' && bottomEnd.kind === 'open') continue;
+        if (topEnd.kind === 'anchor' && outward(topEnd.pin).dy === -1 && bottomEnd.kind !== 'anchor') flip();
+        else if (bottomEnd.kind === 'anchor' && outward(bottomEnd.pin).dy === 1 && topEnd.kind !== 'anchor') flip();
 
         const stubEndOf = (a: Extract<ChainEnd, { kind: 'anchor' }>): { x: number; y: number; o: { dx: number; dy: number } } => {
           const at = pinAt(placed.get(a.ref)!, a.pin);
@@ -2737,25 +2770,35 @@ function draftOnce(
         let order = chain;
         if (topEnd.kind === 'anchor') {
           const s = stubEndOf(topEnd);
-          if (s.o.dy === -1) continue; // an up-facing pin cannot feed a downward run
+          if (s.o.dy === -1) {
+            abandon(); // an up-facing pin cannot feed a downward run
+            continue;
+          }
           if (bottomEnd.kind === 'anchor') {
             const b = stubEndOf(bottomEnd);
             // both ends must sit on one axis with the second anchor below and
             // able to receive from above, else leave the columns alone
-            if (!sameCoord(s.x, b.x) || b.y <= s.y || b.o.dy === 1) continue;
+            if (!sameCoord(s.x, b.x) || b.y <= s.y || b.o.dy === 1) {
+              abandon();
+              continue;
+            }
           }
           axisX = s.x;
           cursor = s.y + CHAIN_GAP;
         } else if (bottomEnd.kind === 'anchor') {
           // rail above, anchor below (a pull-up): stack upward from the anchor
           const s = stubEndOf(bottomEnd);
-          if (s.o.dy === 1) continue; // a down-facing pin cannot feed an upward run
+          if (s.o.dy === 1) {
+            abandon(); // a down-facing pin cannot feed an upward run
+            continue;
+          }
           axisX = s.x;
           order = [...chain].reverse();
           // Bounded lift: when a connection row would sit on a foreign stub's
           // crossing (axisClear's segment check), raise the whole stack a grid
           // row at a time rather than shipping the contact or losing the idiom.
           const netOf = (key: string, pinN: string): string => netByEndpoint.get(epOf(key, pinN))?.name ?? '';
+          let lifted = false;
           for (let lift = 0; lift < 3; lift++) {
             let up = s.y - CHAIN_GAP - lift * 2 * U;
             const moves = new Map<string, Placed>();
@@ -2775,8 +2818,12 @@ function draftOnce(
               moves,
               topEnd.kind === 'power' ? [powerEndBox(axisX, topY, -1)] : [],
             );
-            if (done) break;
+            if (done) {
+              lifted = true;
+              break;
+            }
           }
+          if (!lifted) abandon();
           continue;
         } else {
           // both ends are rails: a divider — straighten in place on its own axis
@@ -2788,6 +2835,7 @@ function draftOnce(
         }
         const cursor0 = cursor;
         const netOf2 = (key: string, pinN: string): string => netByEndpoint.get(epOf(key, pinN))?.name ?? '';
+        let stacked = false;
         for (let lift = 0; lift < 3; lift++) {
           cursor = cursor0 + lift * 2 * U;
           const moves = new Map<string, Placed>();
@@ -2815,9 +2863,13 @@ function draftOnce(
           const endNet = conn.length ? conn[0]!.net : '';
           const startConn = { y: cursor0 - CHAIN_GAP, net: topEnd.kind === 'anchor' ? netOf2(topEnd.ref, topEnd.pin.number) : endNet };
           const lastConn = { y: axisEndY, net: bottomEnd.kind === 'anchor' ? netOf2(bottomEnd.ref, bottomEnd.pin.number) : (conn.length ? conn[conn.length - 1]!.net : '') };
-          if (fits && finalizeMoves([{ axisX, ys: [cursor0 - CHAIN_GAP, axisEndY], conn: [startConn, ...conn, lastConn] }], moves, clearBoxes)) break;
+          if (fits && finalizeMoves([{ axisX, ys: [cursor0 - CHAIN_GAP, axisEndY], conn: [startConn, ...conn, lastConn] }], moves, clearBoxes)) {
+            stacked = true;
+            break;
+          }
           if (!fits) break; // lifting only shrinks the room below; no retry can help
         }
+        if (!stacked) abandon();
       }
 
       const memberRefs = [...members.map((m) => m.key), ...capRefs];
@@ -2936,7 +2988,7 @@ function draftOnce(
     const starts: number[] = [];
     for (let j = n; j > 0; j = cut[j]!) starts.unshift(cut[j]!);
     const rowStart = new Set(starts);
-    if (process.env['COPPERHEAD_DRAFT_TRACE']) {
+    if (process.env['COPPERHEAD_DRAFT_TRACE'] === '1') {
       const rows: string[] = [];
       for (let k = 0; k < starts.length; k++) {
         const a = starts[k]!;
@@ -3020,7 +3072,7 @@ function draftOnce(
       maxH = Math.max(maxH, (yUnits - GROUP_GAP) * U - topY);
       colOriginUnits += Math.ceil(Math.max(...members.map(wOf)) / U) + GROUP_GAP + Math.ceil(wrapGap / U);
     }
-    if (process.env['COPPERHEAD_DRAFT_TRACE']) {
+    if (process.env['COPPERHEAD_DRAFT_TRACE'] === '1') {
       trace(`column wrap at ${budgetH.toFixed(0)}: ${starts.map((a, k) => `[${groupRects.slice(a, k + 1 < starts.length ? starts[k + 1]! : n).map((r) => r.name.slice(0, 2).trim()).join('+')}]`).join(' ')} -> ${best[n]!.toFixed(0)} wide`);
     }
     return { deltas, w: best[n]!, h: maxH, kind: 'columns' };
@@ -3034,6 +3086,8 @@ function draftOnce(
    * height open beside a tall one (the hand-laid A2 sheet: power, amplifier
    * and UI in one column, PD, MCU and UART in the next, rails in the third).
    */
+  /** Masonry deals already searched in this draft, by budget and group sizes. */
+  const masonryDeals = new Map<string, number[][] | null>();
   const wrapMasonry = (k: number, budgetH: number): { deltas: { dx: number; dy: number }[]; w: number; h: number; kind: 'masonry' } | null => {
     const originX = groupRects[0]!.x1;
     const topY = Math.min(...groupRects.map((r) => r.y1));
@@ -3044,47 +3098,82 @@ function draftOnce(
     const hOf = (i: number): number => groupRects[i]!.y2 - groupRects[i]!.y1;
     const gap = GROUP_GAP * U + wrapGap;
     // Every way of dealing n groups to k columns (order kept within a
-    // column, columns in the order their first groups are declared) is tried
-    // and the narrowest that fits the height wins; ties go to the shorter.
-    // Seven groups in three columns is 301 deals; a sheet with more groups
-    // than the enumeration affords deals them round-robin.
-    const total = k ** n;
-    let cols: number[][] | null = null;
-    let bestW = Infinity;
-    let bestH = Infinity;
-    const judge = (assign: number[]): void => {
-      const cs: number[][] = Array.from({ length: k }, () => []);
-      assign.forEach((c, i) => cs[c]!.push(i));
-      if (cs.some((c) => !c.length)) return;
-      const hs = cs.map((c) => c.reduce((h, i, m) => h + hOf(i) + (m ? gap : 0), 0));
-      const maxH = Math.max(...hs);
-      if (maxH > budgetH) return;
-      const w = cs.reduce((acc, c) => acc + Math.max(...c.map(wOf)), 0) + (k - 1) * gap;
-      if (w < bestW - 1e-6 || (Math.abs(w - bestW) <= 1e-6 && maxH < bestH)) {
-        bestW = w;
-        bestH = maxH;
-        cols = cs;
-      }
-    };
-    if (total <= 2_000_000) {
+    // column, columns in the order their first groups are declared) is
+    // judged and the narrowest that fits the height wins; ties go to the
+    // shorter. Seven groups in three columns is 301 deals, but twelve in four
+    // is 611 501, and the fit asks for this at every budget of every sheet:
+    // enumerating them all made a twelve-group board draft in tens of
+    // seconds. So the deals are walked as a tree, a group at a time, and a
+    // branch is cut as soon as a column is already too tall, or the columns
+    // opened so far are already wider than the best deal found (or as wide
+    // and as tall): no deal below it could replace the best. The walk visits
+    // deals in the enumeration's order and cuts only branches that could not
+    // win, so the deal it keeps is the one the full enumeration keeps. Past
+    // a node budget the walk stops with the best deal so far, and deals
+    // round-robin when it has found none. Shapes recur across the budgets
+    // the fit tries, so a search is remembered by the groups' sizes.
+    const sizesKey = `${k}|${budgetH}|${gap}|${groupRects.map((_, i) => `${wOf(i)}x${hOf(i)}`).join(',')}`;
+    let cols: number[][] | null | undefined = masonryDeals.get(sizesKey);
+    if (cols === undefined) {
+      let found: number[][] | null = null;
+      let bestW = Infinity;
+      let bestH = Infinity;
+      const judge = (assign: number[]): void => {
+        const cs: number[][] = Array.from({ length: k }, () => []);
+        assign.forEach((c, i) => cs[c]!.push(i));
+        if (cs.some((c) => !c.length)) return;
+        const hs = cs.map((c) => c.reduce((h, i, m) => h + hOf(i) + (m ? gap : 0), 0));
+        const maxH = Math.max(...hs);
+        if (maxH > budgetH) return;
+        const w = cs.reduce((acc, c) => acc + Math.max(...c.map(wOf)), 0) + (k - 1) * gap;
+        if (w < bestW - 1e-6 || (Math.abs(w - bestW) <= 1e-6 && maxH < bestH)) {
+          bestW = w;
+          bestH = maxH;
+          found = cs;
+        }
+      };
       // columns are opened in reading order: the first group starts the
       // first column, and a group may start a new column only when every
       // earlier one is open (a restricted-growth string), so the same deal
       // is never judged under k! column orders
       const assign: number[] = new Array(n).fill(0);
-      const grow = (i: number, open: number): void => {
+      const colH: number[] = new Array(k).fill(0);
+      const colW: number[] = new Array(k).fill(0);
+      const colN: number[] = new Array(k).fill(0);
+      let nodes = 0;
+      const grow = (i: number, open: number, widthSoFar: number, tallest: number): void => {
+        if (nodes > MASONRY_NODE_BUDGET) return;
+        nodes++;
+        if (n - i < k - open) return; // too few groups left to open every column
         if (i === n) {
-          if (open === k) judge(assign);
+          judge(assign);
           return;
         }
         for (let c = 0; c < Math.min(open + 1, k); c++) {
+          const h = colH[c]! + hOf(i) + (colN[c] ? gap : 0);
+          if (h > budgetH) continue;
+          const w = Math.max(colW[c]!, wOf(i));
+          const lowerW = widthSoFar - colW[c]! + w + (k - 1) * gap;
+          const tall = Math.max(tallest, h);
+          if (lowerW > bestW + 1e-6 || (lowerW >= bestW - 1e-6 && tall >= bestH)) continue;
+          const [h0, w0] = [colH[c]!, colW[c]!];
           assign[i] = c;
-          grow(i + 1, Math.max(open, c + 1));
+          colH[c] = h;
+          colW[c] = w;
+          colN[c]!++;
+          grow(i + 1, Math.max(open, c + 1), lowerW - (k - 1) * gap, tall);
+          colN[c]!--;
+          colH[c] = h0;
+          colW[c] = w0;
         }
       };
-      grow(0, 0);
-    } else {
-      judge(groupRects.map((_, i) => i % k));
+      grow(0, 0, 0, 0);
+      if (nodes > MASONRY_NODE_BUDGET) {
+        trace(`masonry k=${k} at ${budgetH.toFixed(0)}: search stopped at ${MASONRY_NODE_BUDGET} nodes, ${found ? 'keeping the best deal so far' : 'dealing round-robin'}`);
+        if (!found) judge(groupRects.map((_, i) => i % k));
+      }
+      cols = found;
+      masonryDeals.set(sizesKey, cols);
     }
     if (!cols) return null;
     const colW = (cols as number[][]).map((c) => Math.max(0, ...c.map(wOf)));
@@ -3112,8 +3201,6 @@ function draftOnce(
     /** The content runs into the title strip beside the title block (the corner itself stays clear). */
     intoStrip?: boolean;
   };
-  /** The title block's width along the bottom edge, as the checker measures it. */
-  const TITLE_BLOCK_W = 110;
   /**
    * Does wrapped content of `w` × `h` fit sheet `p`? The title strip is
    * reserved across the whole width by default; content taller than that
@@ -3296,14 +3383,14 @@ function draftOnce(
   if (fit.wrap) {
     const wrap = fit.wrap;
     if (wrap.kind === 'columns') {
-      const cols = new Set(wrap.deltas.map((d) => d.dx)).size;
+      const cols = new Set(wrap.deltas.map((d, i) => Math.round((groupRects[i]!.x1 + d.dx) / U))).size;
       notes.push(`groups wrapped onto ${cols} columns to fit the sheet (declared order runs down each column)`);
     } else if (wrap.kind === 'masonry') {
-      const cols = new Set(wrap.deltas.map((d) => d.dx)).size;
+      const cols = new Set(wrap.deltas.map((d, i) => Math.round((groupRects[i]!.x1 + d.dx) / U))).size;
       notes.push(`groups laid in ${cols} columns to fit the sheet (declared order runs along the rows; each column stacks its own groups)`);
     } else {
-      // rows are counted by where their boxes land, not by the shift each
-      // took to get there (groups of one row start at different heights)
+      // rows, like columns above, are counted by where their boxes land, not
+      // by the shift each took to get there (every group starts elsewhere)
       const rows = new Set(wrap.deltas.map((d, i) => Math.round((groupRects[i]!.y1 + d.dy) / U))).size;
       if (rows > 1) notes.push(`groups wrapped onto ${rows} rows to fit the sheet`);
     }
@@ -3566,6 +3653,7 @@ function draftOnce(
         const y = c.ep.at.y + c.o.dy * STUB * U;
         const seg = { x1: prev.ep.at.x, y1: y, x2: c.ep.at.x, y2: y };
         return (
+          groupOf.get(prev.ep.ref) === groupOf.get(c.ep.ref) &&
           c.ep.at.x - prev.ep.at.x <= BANK_PITCH_MAX * U &&
           !powerBodies.some((b) => segCrossesBody(seg.x1, seg.y1, seg.x2, seg.y2, b)) &&
           !touchesForeign([seg], net.name, ownEps, { predictStubs: true }) &&
@@ -3935,31 +4023,46 @@ function draftOnce(
       else clusters.push([s]);
     }
     const wiredStubs = new Set<Stub>();
-    for (const cl of clusters) {
-      if (cl.length < 2 || cl.length > MAX_WIRED_ENDPOINTS) continue;
+    for (const found of clusters) {
+      // A cluster past the wired-net size is a pin with its hung parts plus
+      // whatever else sits within span: it is narrowed to the largest set of
+      // endpoints bound to one anchor, so the parts hung on a pin are wired
+      // to it however many there are, and the rest keep stubs and labels.
+      let cl = found;
+      if (cl.length > MAX_WIRED_ENDPOINTS) {
+        const byAnchor = new Map<string, Stub[]>();
+        for (const s of cl) byAnchor.set(anchorKey(s.ep.ref), [...(byAnchor.get(anchorKey(s.ep.ref)) ?? []), s]);
+        cl = [...byAnchor.values()].reduce((a, b) => (b.length > a.length ? b : a));
+        trace(`route ${net.name}: cluster of ${found.length} narrowed to ${cl.length} bound to ${anchorKey(cl[0]!.ep.ref)}`);
+      }
+      if (cl.length < 2) continue;
       // the whole cluster, else the largest subset that routes: a run on the
       // IC pin's row still draws as a wire when a third endpoint's branch
-      // cannot be cleared, and only that endpoint keeps a stub label
+      // cannot be cleared, and only that endpoint keeps a stub label. Subsets
+      // are tried largest first in index order, at most ROUTE_ATTEMPTS.
+      let attempts = 0;
       let done = false;
-      for (let size = cl.length; size >= 2 && !done; size--) {
-        const subsets: Stub[][] = [];
-        const pick = (start: number, cur: Stub[]): void => {
-          if (cur.length === size) {
-            subsets.push([...cur]);
-            return;
-          }
-          for (let i = start; i < cl.length; i++) pick(i + 1, [...cur, cl[i]!]);
-        };
-        pick(0, []);
-        for (const sub of subsets) {
-          const r = routeStubs(sub);
-          if (!r) continue;
+      const cur: Stub[] = [];
+      const pick = (start: number, size: number): void => {
+        if (done || attempts >= ROUTE_ATTEMPTS) return;
+        if (cur.length === size) {
+          attempts++;
+          const r = routeStubs(cur);
+          if (!r) return;
+          const sub = [...cur];
           commitRoute(sub, r);
           for (const s of sub) wiredStubs.add(s);
           done = true;
-          break;
+          return;
         }
-      }
+        for (let i = start; i <= cl.length - (size - cur.length) && !done; i++) {
+          cur.push(cl[i]!);
+          pick(i + 1, size);
+          cur.pop();
+        }
+      };
+      for (let size = cl.length; size >= 2 && !done && attempts < ROUTE_ATTEMPTS; size--) pick(0, size);
+      if (!done && attempts >= ROUTE_ATTEMPTS) trace(`route ${net.name}: ${ROUTE_ATTEMPTS} subsets of ${cl.length} tried, none routed`);
     }
     for (const s of stubs) {
       if (wiredStubs.has(s)) continue;
@@ -4019,7 +4122,7 @@ function draftOnce(
     }
   }
 
-  if (process.env['COPPERHEAD_DRAFT_TRACE']) {
+  if (process.env['COPPERHEAD_DRAFT_TRACE'] === '1') {
     // every crossing of two nets' wires, for the trace: a comb whose lanes
     // cross another pin's row is legal, but a drafter wants to know where
     const H = wires.filter((w) => sameCoord(w.y1, w.y2));
@@ -4444,6 +4547,7 @@ function draftOnce(
         predictStubs: false,
       });
     const rideTo = (x: number, y: number): void => {
+      if (!sameCoord(x, lb.x) || !sameCoord(y, lb.y)) trace(`label ${lb.name}: rides its stub from (${lb.x}, ${lb.y}) to (${x}, ${y})`);
       stub.x2 = x;
       stub.y2 = y;
       lb.x = x;
@@ -4498,6 +4602,7 @@ function draftOnce(
           (sameCoord(c.x, lb.x) && sameCoord(c.y, lb.y) ? true : wireClearAt(c.x, c.y)),
       );
       if (flip) {
+        trace(`label ${lb.name}: turns to rotation ${flipRot} to clear`);
         lb.rot = flipRot;
         rideTo(flip.x, flip.y);
         continue;
@@ -4539,9 +4644,9 @@ function draftOnce(
     const clearFor = (self: EmitSymbol, b: Bounds): boolean =>
       !bodies.some((bd) => boundsOverlap(b, bd)) &&
       !wires.some((w) => segHitsBoxEarly(w, b)) &&
-      !labelBoxesFinal.some((lb) => boundsOverlap(lb, b)) &&
-      !memberText.some((t) => boundsOverlap(t, b)) &&
-      ![...liveBoxes].some(([o, ob]) => o !== self && boundsOverlap(ob, b));
+      !labelBoxesFinal.some((lb) => boundsOverlap(lb, padBox(b))) &&
+      !memberText.some((t) => boundsOverlap(t, padBox(b))) &&
+      ![...liveBoxes].some(([o, ob]) => o !== self && boundsOverlap(ob, padBox(b)));
     for (const s of valueEntries) {
       if (clearFor(s, liveBoxes.get(s)!)) continue;
       // outward = the side of the symbol the text was already offset to
@@ -4895,7 +5000,7 @@ function draftOnce(
     const boxes = new Map<string, Bounds>();
     const dbgSrc = new Map<string, string[]>();
     const extend = (key: string, b: Bounds, why = 'body'): void => {
-      if (process.env['COPPERHEAD_DRAFT_TRACE']) dbgSrc.set(key, [...(dbgSrc.get(key) ?? []), `${why}[${b.minX.toFixed(0)},${b.minY.toFixed(0)}..${b.maxX.toFixed(0)},${b.maxY.toFixed(0)}]`]);
+      if (process.env['COPPERHEAD_DRAFT_TRACE'] === '1') dbgSrc.set(key, [...(dbgSrc.get(key) ?? []), `${why}[${b.minX.toFixed(0)},${b.minY.toFixed(0)}..${b.maxX.toFixed(0)},${b.maxY.toFixed(0)}]`]);
       const cur = boxes.get(key);
       boxes.set(key, cur ? { minX: Math.min(cur.minX, b.minX), minY: Math.min(cur.minY, b.minY), maxX: Math.max(cur.maxX, b.maxX), maxY: Math.max(cur.maxY, b.maxY) } : { ...b });
     };

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdtemp, cp, rm, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, cp, rm, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { draftSchematic } from '../src/kicad/draft/draft.js';
 import { checkLegibility } from '../src/kicad/legibility.js';
@@ -297,6 +297,37 @@ describe('everything on its pin (AC-16.40 to AC-16.47)', () => {
     const p = pinsOfUnit(sh.libPins.get(s.libId) ?? [], s.unit).find((q) => q.number === pin)!;
     return pinAbsolute(s.at, s.mirror, p);
   };
+
+  it('every part hung on one pin is wired to it, however many hang there (AC-16.37)', async () => {
+    // Four or five pull-downs on one pin make a cluster past the wired-net
+    // size. It was skipped whole: the pin and every resistor kept a stub and
+    // a flag of their own, and no wire joined the pin to anything it serves.
+    for (const count of [4, 5]) {
+      const rs = Array.from({ length: count }, (_, i) => `R${i + 1}`);
+      const { schematicPath, cleanup } = await draftRepo(
+        {
+          version: 1,
+          parts: [{ ref: 'U1', libId: 'CopperMCU:MCU8', value: 'MCU8', group: 'Main' }, ...rs.map((ref) => ({ ref, libId: 'Device:R', value: '10k', group: 'Main' }))],
+          nets: [
+            { name: 'BIG', pins: ['U1.4', ...rs.map((r) => `${r}.1`)] },
+            { name: 'GND', pins: ['U1.2', ...rs.map((r) => `${r}.2`)] },
+            { name: 'VCC', pins: ['U1.1', 'U1.5'] },
+          ],
+          noConnect: ['U1.3', 'U1.6', 'U1.7', 'U1.8'],
+        },
+        ['Main'],
+      );
+      try {
+        const text = await readFile(schematicPath, 'utf8');
+        // one wired run, named once
+        expect((text.match(/\((?:label|global_label) "BIG"/g) ?? []).length, `${count} parts on U1.4`).toBe(1);
+        const { attached, twoPin } = await attachedOf(schematicPath);
+        expect(attached).toBe(twoPin);
+      } finally {
+        await cleanup();
+      }
+    }
+  }, 60000);
 
   it('a series resistor into a base ends the run with the transistor on the row, base to the pin (AC-16.42)', async () => {
     const { schematicPath, syms, cleanup } = await draftRepo(

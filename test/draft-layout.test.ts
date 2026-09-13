@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdtemp, mkdir, cp, rm, readFile, writeFile } from 'node:fs/promises';
@@ -674,47 +674,59 @@ describe('label nudging keeps a stub label attached and clear', () => {
     // on every placement rule before the pass, so the test searches seeded
     // intents for the first that nudges and checks the invariants on it;
     // a placement change that leaves no nudge in a few hundred small boards
-    // would be a change to look at, and fails here.
+    // would be a change to look at, and fails here. The nudge is read from
+    // the draft trace (a ride along the stub, or a turn of the label): stub
+    // lengths alone cannot tell it from the wire pass's own electrical rungs.
     let seen = 0;
     let nudgedOnce = false;
-    for (let seed = 1; seed <= 400 && !nudgedOnce; seed++) {
-      const intent = seeded(seed);
-      const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-nudge-'));
-      let model: Awaited<ReturnType<typeof place>>['model'];
-      let symbols: Awaited<ReturnType<typeof place>>['symbols'];
-      try {
-        const symsource = new SymbolSource(repo, [SYMLIB]);
-        const v = await validateIntent(intent, symsource, null);
-        if (!v.ok) continue;
-        ({ model, symbols } = { ...draftSchematicPlacement(v.validated!, 'board', '2020-01-01'), symbols: v.validated!.symbols });
-      } finally {
-        await rm(repo, { recursive: true, force: true });
+    const traced: string[] = [];
+    const traceWas = process.env['COPPERHEAD_DRAFT_TRACE'];
+    process.env['COPPERHEAD_DRAFT_TRACE'] = '1';
+    const quiet = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      traced.push(args.join(' '));
+    });
+    try {
+      for (let seed = 1; seed <= 400 && !nudgedOnce; seed++) {
+        const intent = seeded(seed);
+        const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-nudge-'));
+        let model: Awaited<ReturnType<typeof place>>['model'];
+        let symbols: Awaited<ReturnType<typeof place>>['symbols'];
+        traced.length = 0;
+        try {
+          const symsource = new SymbolSource(repo, [SYMLIB]);
+          const v = await validateIntent(intent, symsource, null);
+          if (!v.ok) continue;
+          ({ model, symbols } = { ...draftSchematicPlacement(v.validated!, 'board', '2020-01-01'), symbols: v.validated!.symbols });
+        } finally {
+          await rm(repo, { recursive: true, force: true });
+        }
+        seen++;
+        const pinPoints = new Set<string>();
+        for (const s of model.symbols) {
+          for (const p of symbols.get(s.ref)?.pins ?? []) pinPoints.add(`${s.at.x + p.x},${s.at.y - p.y}`);
+        }
+        const stubOf = (l: { x: number; y: number }) =>
+          model.wires.find((w) => w.x2 === l.x && w.y2 === l.y && pinPoints.has(`${w.x1},${w.y1}`));
+        const stubLabels = model.labels.map((l) => ({ l, w: stubOf(l) })).filter((e) => e.w !== undefined);
+        // every stub label is still an endpoint of the stub that starts at its
+        // pin: nudging extends the wire, it never detaches the label from it
+        const lengths = stubLabels.map((e) => Math.hypot(e.w!.x2 - e.w!.x1, e.w!.y2 - e.w!.y1) / U);
+        for (const len of lengths) {
+          // a stub may retreat to one unit (the last rung of the nudge), never
+          // shorter; and never past the nudge budget
+          expect(len).toBeGreaterThan(1 - 0.001);
+          expect(len).toBeLessThanOrEqual(STUB + 8); // MAX_LABEL_NUDGE
+        }
+        if (traced.some((l) => /^\[draft\] label .+: (rides its stub|turns to rotation)/.test(l))) nudgedOnce = true;
       }
-      seen++;
-      const pinPoints = new Set<string>();
-      for (const s of model.symbols) {
-        for (const p of symbols.get(s.ref)?.pins ?? []) pinPoints.add(`${s.at.x + p.x},${s.at.y - p.y}`);
-      }
-      const stubOf = (l: { x: number; y: number }) =>
-        model.wires.find((w) => w.x2 === l.x && w.y2 === l.y && pinPoints.has(`${w.x1},${w.y1}`));
-      const stubLabels = model.labels.map((l) => ({ l, w: stubOf(l) })).filter((e) => e.w !== undefined);
-      // every stub label is still an endpoint of the stub that starts at its
-      // pin: nudging extends the wire, it never detaches the label from it
-      const lengths = stubLabels.map((e) => Math.hypot(e.w!.x2 - e.w!.x1, e.w!.y2 - e.w!.y1) / U);
-      for (const len of lengths) {
-        // a stub may retreat to one unit (the last rung of the nudge), never
-        // shorter; and never past the nudge budget
-        expect(len).toBeGreaterThan(1 - 0.001);
-        expect(len).toBeLessThanOrEqual(STUB + 8); // MAX_LABEL_NUDGE
-      }
-      if (lengths.some((len) => len > STUB + 0.001)) nudgedOnce = true;
+    } finally {
+      quiet.mockRestore();
+      if (traceWas === undefined) delete process.env['COPPERHEAD_DRAFT_TRACE'];
+      else process.env['COPPERHEAD_DRAFT_TRACE'] = traceWas;
     }
-    // The search stops at the first nudging board; every board before it was
-    // checked for the attachment invariant too. Since pin-anchored placement
-    // and padded label clearance, the seeded boards draft with every stub
-    // label clear where it stands, so the pass has nothing to ride: the
-    // attachment invariant above is the contract, checked on every board.
-    expect(seen).toBeGreaterThan(100);
-    void nudgedOnce;
+    // every board up to the first that nudges was checked for the attachment
+    // invariant above; the nudge itself is the sentinel
+    expect(seen).toBeGreaterThan(0);
+    expect(nudgedOnce, 'no seeded intent produced a nudge').toBe(true);
   }, 120000);
 });

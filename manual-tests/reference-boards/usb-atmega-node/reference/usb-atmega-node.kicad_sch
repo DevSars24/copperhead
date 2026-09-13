@@ -3928,7 +3928,7 @@
 		(property "Reference" "#PWR05" (at 250.19 59.69 0)
 			(effects (font (size 1.27 1.27)) hide)
 		)
-		(property "Value" "+3V3" (at 223.393 59.69 0)
+		(property "Value" "+3V3" (at 223.393 58.42 0)
 			(effects (font (size 1.27 1.27)))
 		)
 		(property "Footprint" "" (at 227.33 59.69 0)
