@@ -252,9 +252,13 @@ describe('mutating tools are serialized per repo (spec: serialization)', () => {
     // taken for as long as the loser can still reach it.
     const realRelease = RepoLocks.prototype.release;
     const held: (() => void)[] = [];
+    const releasedAfterDocs: boolean[] = [];
     const release = vi
       .spyOn(RepoLocks.prototype, 'release')
       .mockImplementation(function (this: RepoLocks, root: string) {
+        // Holding the release must not hide one that comes too early: record
+        // whether the run had already written its docs when it let go.
+        releasedAfterDocs.push(existsSync(path.join(root, 'docs', 'SPEC.md')));
         held.push(() => realRelease.call(this, root));
       });
     try {
@@ -269,6 +273,7 @@ describe('mutating tools are serialized per repo (spec: serialization)', () => {
       expect(envs.filter((e) => e.ok), 'the other must succeed').toHaveLength(1);
       // Only the holder releases: the refused call returned before taking the lock.
       expect(release).toHaveBeenCalledTimes(1);
+      expect(releasedAfterDocs, 'the lock must stay held until the run has written its docs').toEqual([true]);
     } finally {
       release.mockRestore();
       for (const run of held.splice(0)) run();
