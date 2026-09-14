@@ -118,4 +118,3 @@ When a reply contains tool calls not present in the current turn's tool catalog,
 
 - **WHEN** a model emits a batched reply containing both a withheld tool call and a `finish` call
 - **THEN** `finish` is not dispatched, a tool result indicates the withheld call did not run, and the run does not commit
-
