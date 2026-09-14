@@ -12,6 +12,7 @@ import { dispatchTool, type RunContext } from '../src/agent/tools.js';
 import { ObligationsLedger } from '../src/agent/ledger.js';
 import { Transcript } from '../src/agent/transcript.js';
 import { loadConfig } from '../src/config.js';
+import { contractGapDetail, STAGES } from '../src/commands/create.js';
 
 /**
  * Text-protocol test provider that simulates claude-code / cursor:
@@ -150,13 +151,18 @@ describe('Issue #296: Withheld tool calls and finish guard', () => {
       expect(extraContent).toBe('# Extra Documentation\n\nSome content.');
 
       // Check the messages seen by the provider in turn 2:
-      // It should have received a user message explaining that write_file was withheld and finish was blocked
+      // It should have received a tool message for finish explaining why it didn't run,
+      // and a user message explaining that write_file was withheld.
       const turn2Messages = provider.seen[1]!;
+      const toolMessages = turn2Messages.filter((m) => m.role === 'tool');
+      const finishToolMsg = toolMessages.find((m) => m.content.includes('finish not run'));
+      expect(finishToolMsg).toBeDefined();
+      expect(finishToolMsg!.content).toContain('"write_file"');
+
       const userMessages = turn2Messages.filter((m) => m.role === 'user');
       const lastUserMsg = userMessages[userMessages.length - 1]!;
       expect(lastUserMsg.content).toContain('withheld');
       expect(lastUserMsg.content).toContain('"write_file"');
-      expect(lastUserMsg.content).toContain('Cannot finish yet');
     } finally {
       await cleanup();
     }
@@ -182,7 +188,7 @@ describe('Issue #296: Withheld tool calls and finish guard', () => {
         request: 'test guard',
         model: 'claude-code',
         provider,
-        maxTurns: 3,
+        maxTurns: 5,
         log: () => {},
         finishGuard: async () => {
           guardChecked++;
@@ -201,6 +207,379 @@ describe('Issue #296: Withheld tool calls and finish guard', () => {
       const userMessages = turn2Messages.filter((m) => m.role === 'user');
       const feedbackMsg = userMessages.find((m) => m.content.includes('Cannot finish yet: stage requirement not met'));
       expect(feedbackMsg).toBeDefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('F1: a throw inside finishGuard routes through fail() with exitPath finish-guard-error', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      await runInit({ repoRoot: repo, installHooks: false });
+      await execa('git', ['add', '-A'], { cwd: repo });
+      await execa('git', ['commit', '-q', '-m', 'initial'], { cwd: repo });
+
+      const turn1 = [
+        '```json',
+        JSON.stringify({
+          tool: 'propose_change',
+          args: { id: 'test-f1', why: 'needed', what_changes: '- write note', tasks: '- [ ] write note' },
+        }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'validate_change', args: {} }),
+        '```',
+      ].join('\n\n');
+
+      const turn2 = [
+        '```json',
+        JSON.stringify({
+          tool: 'write_file',
+          args: { path: 'docs/NOTE.md', content: '# Note\n' },
+        }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'check_drift', args: {} }),
+        '```',
+        '```json',
+        JSON.stringify({
+          tool: 'finish',
+          args: { outcome: 'done', summary: 'done' },
+        }),
+        '```',
+      ].join('\n\n');
+
+      const provider = textProtocolProvider([turn1, turn2]);
+
+      const res = await runAgentLoop({
+        repoRoot: repo,
+        request: 'test throwing guard',
+        model: 'claude-code',
+        provider,
+        maxTurns: 5,
+        log: () => {},
+        finishGuard: async () => {
+          throw new Error('corrupted stage validation');
+        },
+      });
+
+      expect(res.outcome).toBe('failure');
+      expect(res.exitPath).toBe('finish-guard-error');
+      expect(res.summary).toContain('corrupted stage validation');
+
+      // Working tree is restored (docs/NOTE.md should not exist in working tree)
+      expect(existsSync(path.join(repo, 'docs', 'NOTE.md'))).toBe(false);
+
+      // summary.md exists in transcript dir
+      const summaryFile = path.join(res.transcriptDir, 'summary.md');
+      expect(existsSync(summaryFile)).toBe(true);
+      const summaryText = await readFile(summaryFile, 'utf8');
+      expect(summaryText).toContain('finish-guard-error');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('F2: locked-only tool call replies end stalled within 3 turns', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      await runInit({ repoRoot: repo, installHooks: false });
+      await execa('git', ['add', '-A'], { cwd: repo });
+      await execa('git', ['commit', '-q', '-m', 'initial'], { cwd: repo });
+
+      // Model keeps emitting locked write_file without propose/validate
+      const lockedReply = '```json\n{"tool": "write_file", "args": {"path": "docs/SPEC.md", "content": "# Spec"}}\n```';
+      const provider = textProtocolProvider([lockedReply, lockedReply, lockedReply, lockedReply]);
+
+      const res = await runAgentLoop({
+        repoRoot: repo,
+        request: 'locked only test',
+        model: 'claude-code',
+        provider,
+        maxTurns: 12,
+        log: () => {},
+      });
+
+      expect(res.outcome).toBe('failure');
+      expect(res.exitPath).toBe('stalled');
+      expect(res.stats.turnsUsed).toBeLessThanOrEqual(3);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('F3: contractGapDetail returns actionable per-stage reasons', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      const config = { ...(await loadConfig(repo)), docs: 'docs', schematic: 'test.kicad_sch', board: 'test.kicad_pcb' };
+
+      const gapSpecMissing = await contractGapDetail('spec-seed', repo, config);
+      expect(gapSpecMissing).toBe('docs/SPEC.md does not exist');
+
+      const gapArchMissing = await contractGapDetail('architecture', repo, config);
+      expect(gapArchMissing).toBe('docs/SUBSYSTEMS.md does not exist');
+
+      const gapBomMissing = await contractGapDetail('part-selection', repo, config);
+      expect(gapBomMissing).toBe('docs/BOM.md does not exist');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('F3: bounds consecutive guard rejections with no intervening file changes to 3 turns', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      await runInit({ repoRoot: repo, installHooks: false });
+      await execa('git', ['add', '-A'], { cwd: repo });
+      await execa('git', ['commit', '-q', '-m', 'initial'], { cwd: repo });
+
+      // Model keeps trying to finish without making any edits
+      const finishReply = '```json\n{"tool": "finish", "args": {"outcome": "done", "summary": "premature finish"}}\n```';
+      const provider = textProtocolProvider([finishReply, finishReply, finishReply, finishReply, finishReply]);
+
+      const res = await runAgentLoop({
+        repoRoot: repo,
+        request: 'test bounded guard rejections',
+        model: 'claude-code',
+        provider,
+        maxTurns: 10,
+        log: () => {},
+        finishGuard: async () => 'SPEC.md needs Budgets section',
+      });
+
+      expect(res.outcome).toBe('failure');
+      expect(res.exitPath).toBe('stalled');
+      expect(res.stats.turnsUsed).toBe(3);
+      expect(res.summary).toContain('SPEC.md needs Budgets section');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('F6: mixed-reply with withheld tool call and no finish surfaces withheld notice', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      await runInit({ repoRoot: repo, installHooks: false });
+      await execa('git', ['add', '-A'], { cwd: repo });
+      await execa('git', ['commit', '-q', '-m', 'initial'], { cwd: repo });
+
+      // Turn 1: propose_change + validate_change + locked write_file (no finish)
+      const turn1 = [
+        '```json',
+        JSON.stringify({
+          tool: 'propose_change',
+          args: { id: 'test-mixed', why: 'test', what_changes: '- test', tasks: '- [ ] test' },
+        }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'validate_change', args: {} }),
+        '```',
+        '```json',
+        JSON.stringify({
+          tool: 'write_file',
+          args: { path: 'docs/TEST.md', content: '# Test' },
+        }),
+        '```',
+      ].join('\n\n');
+
+      // Turn 2: write_file + finish
+      const turn2 = [
+        '```json',
+        JSON.stringify({
+          tool: 'write_file',
+          args: { path: 'docs/TEST.md', content: '# Test' },
+        }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'check_drift', args: {} }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'finish', args: { outcome: 'done', summary: 'complete' } }),
+        '```',
+      ].join('\n\n');
+
+      const provider = textProtocolProvider([turn1, turn2]);
+
+      const res = await runAgentLoop({
+        repoRoot: repo,
+        request: 'test mixed notice',
+        model: 'claude-code',
+        provider,
+        maxTurns: 5,
+        log: () => {},
+      });
+
+      expect(res.outcome).toBe('success');
+
+      // Verify turn 2 received the withheld notice in user message
+      const turn2Messages = provider.seen[1]!;
+      const userMessages = turn2Messages.filter((m) => m.role === 'user');
+      const noticeMsg = userMessages.find((m) => m.content.includes('withheld because it was not in this turn\'s tool catalog'));
+      expect(noticeMsg).toBeDefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('F6: issue #296 brief-only repro creates docs/ and appends changelog from uninitialized repo', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      // In this test, runInit is NOT called; docs/ does not exist.
+      const turn1 = [
+        '```json',
+        JSON.stringify({ tool: 'read_file', args: { path: 'docs/SPEC.md' } }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'search', args: { pattern: 'BirdBox' } }),
+        '```',
+      ].join('\n\n');
+
+      const turn2 = [
+        '```json',
+        JSON.stringify({
+          tool: 'propose_change',
+          args: { id: 'spec-seed', why: 'seed requirements', what_changes: '- docs/SPEC.md', tasks: '- [ ] write docs/SPEC.md' },
+        }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'validate_change', args: {} }),
+        '```',
+        '```json',
+        JSON.stringify({
+          tool: 'write_file',
+          args: { path: 'docs/SPEC.md', content: '# BirdBox\n\n## Budgets\n\n- board: 50x50 mm (ASSUMED)\n' },
+        }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'check_drift', args: {} }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'finish', args: { outcome: 'done', summary: 'SPEC.md seeded' } }),
+        '```',
+      ].join('\n\n');
+
+      const turn3 = [
+        '```json',
+        JSON.stringify({
+          tool: 'write_file',
+          args: { path: 'docs/SPEC.md', content: '# BirdBox\n\n## Budgets\n\n- board: 50x50 mm (ASSUMED)\n' },
+        }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'check_drift', args: {} }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'finish', args: { outcome: 'done', summary: 'SPEC.md seeded on turn 3' } }),
+        '```',
+      ].join('\n\n');
+
+      const provider = textProtocolProvider([turn1, turn2, turn3]);
+
+      const res = await runAgentLoop({
+        repoRoot: repo,
+        request: 'create pipeline stage: spec-seed',
+        stagePrompt: 'Stage 1: write docs/SPEC.md',
+        model: 'claude-code',
+        provider,
+        maxTurns: 5,
+        log: () => {},
+      });
+
+      expect(res.outcome).toBe('success');
+      expect(res.exitPath).toBe('done');
+      expect(existsSync(path.join(repo, 'docs', 'SPEC.md'))).toBe(true);
+      const specContent = await readFile(path.join(repo, 'docs', 'SPEC.md'), 'utf8');
+      expect(specContent).toContain('## Budgets');
+
+      // CHANGELOG.md should also exist in docs/
+      expect(existsSync(path.join(repo, 'docs', 'CHANGELOG.md'))).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('F6: create wiring of finishGuard checks real stage contract and provides per-stage rejection', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      const config = await loadConfig(repo);
+      const stage = STAGES[0]!; // spec-seed
+
+      // Turn 1: Unlock edits
+      const turn1 = [
+        '```json',
+        JSON.stringify({
+          tool: 'propose_change',
+          args: { id: 'test-seed', why: 'seed', what_changes: '- spec', tasks: '- [ ] spec' },
+        }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'validate_change', args: {} }),
+        '```',
+      ].join('\n\n');
+
+      // Turn 2: Write incomplete SPEC.md without Budgets content and try to finish
+      const turn2 = [
+        '```json',
+        JSON.stringify({
+          tool: 'write_file',
+          args: {
+            path: 'docs/SPEC.md',
+            content: '# Incomplete Spec\n\n## Overview\nNo budgets here.\n',
+          },
+        }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'check_drift', args: {} }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'finish', args: { outcome: 'done', summary: 'incomplete spec' } }),
+        '```',
+      ].join('\n\n');
+
+      // Turn 3: Edit SPEC.md to add Budgets and finish
+      const turn3 = [
+        '```json',
+        JSON.stringify({
+          tool: 'edit_file',
+          args: {
+            path: 'docs/SPEC.md',
+            old_string: 'No budgets here.',
+            new_string: '## Budgets\n\n- board: 50x50 mm\n- power: 100mA\n',
+          },
+        }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'check_drift', args: {} }),
+        '```',
+        '```json',
+        JSON.stringify({ tool: 'finish', args: { outcome: 'done', summary: 'completed spec' } }),
+        '```',
+      ].join('\n\n');
+
+      const provider = textProtocolProvider([turn1, turn2, turn3]);
+
+      const res = await runAgentLoop({
+        repoRoot: repo,
+        request: 'create pipeline stage: spec-seed',
+        model: 'claude-code',
+        provider,
+        maxTurns: 5,
+        log: () => {},
+        finishGuard: async () => {
+          if (await stage.isComplete(repo, config.docs)) return null;
+          const gap = await contractGapDetail(stage.name, repo, config);
+          return `stage completion contract for "${stage.name}" is not yet satisfied: ${gap}`;
+        },
+      });
+
+      expect(res.outcome).toBe('success');
+      expect(res.exitPath).toBe('done');
+
+      // Check turn 3 feedback message contains the specific stage contract gap from turn 2's rejection
+      const turn3Messages = provider.seen[2]!;
+      const userMessages = turn3Messages.filter((m) => m.role === 'user');
+      const rejectionMsg = userMessages.find((m) => m.content.includes("Cannot finish yet: stage completion contract for \"spec-seed\" is not yet satisfied: docs/SPEC.md needs a heading containing 'Budgets'"));
+      expect(rejectionMsg).toBeDefined();
     } finally {
       await cleanup();
     }

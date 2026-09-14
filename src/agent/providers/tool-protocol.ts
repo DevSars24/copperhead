@@ -1,4 +1,4 @@
-import type { Msg, ToolCall, ToolSchema } from '../types.js';
+import type { Msg, ToolCall, ToolSchema, WithheldCall } from '../types.js';
 
 export function renderToolProtocol(tools: ToolSchema[]): string {
   if (!tools.length) return '';
@@ -68,12 +68,6 @@ export function renderConversation(messages: Msg[]): string {
     }
   }
   return parts.join('\n\n');
-}
-
-export interface WithheldCall {
-  name: string;
-  args: Record<string, unknown>;
-  reason: string;
 }
 
 export interface ParsedToolTurn {

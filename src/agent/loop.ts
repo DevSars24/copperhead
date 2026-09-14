@@ -442,6 +442,17 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
       cacheHits: cacheHits(),
     };
   };
+  const FILE_MODIFYING_TOOLS = new Set([
+    'write_file',
+    'edit_file',
+    'draft_schematic',
+    'record_decision',
+    'record_constraint',
+    'resolve_affected',
+  ]);
+  let fileMutations = 0;
+  let lastGuardMutationCount = -1;
+  let consecutiveGuardRejections = 0;
 
   let budget = maxTurns;
   for (let turn = 0; ; turn++) {
@@ -582,20 +593,10 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
 
     if (!res.toolCalls.length) {
       if (res.withheld?.length) {
-        nudges = 0;
-        const names = res.withheld.map((w) => `"${w.name}"`).join(', ');
         for (const w of res.withheld) {
           await transcript.event('tool-withheld', { name: w.name, args: w.args, reason: w.reason });
           r.toolResult(w.name, `withheld (${w.reason})`, false);
         }
-        messages.push({
-          role: 'user',
-          content:
-            `No call ran for ${names}: ${res.withheld.length > 1 ? 'these tools are' : 'this tool is'} not in this turn's tool ` +
-            `catalog. Edit and drafting tools are withheld until a proposal validates — call propose_change, ` +
-            `then validate_change, and they appear. Available this turn: ${[...tools.map((t) => t.name)].join(', ')}.`,
-        });
-        continue;
       }
       // Only *consecutive* tool-less turns are a stall. Providers emit the
       // occasional empty completion mid-run (observed live: three empties
@@ -613,7 +614,23 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
     nudges = 0;
 
     for (const call of res.toolCalls) {
+      if (res.withheld?.length && call.name === 'finish') {
+        const withheldNames = res.withheld.map((w) => `"${w.name}"`).join(', ');
+        const finishMsg = `finish not run: ${withheldNames} in this reply did not run (${res.withheld[0]?.reason ?? 'withheld'}). Complete or retry them before calling finish.`;
+        r.toolResult('finish', finishMsg, false);
+        await transcript.event('tool', {
+          name: 'finish',
+          args: call.args,
+          result: finishMsg,
+          envelope: { ok: false, summary: finishMsg, data: { error: finishMsg } },
+        });
+        messages.push({ role: 'tool', toolCallId: call.id, content: finishMsg });
+        continue;
+      }
       const envelope = await dispatchToolResult(ctx, call.name, call.args, { provider });
+      if (envelope.ok && FILE_MODIFYING_TOOLS.has(call.name)) {
+        fileMutations++;
+      }
       const result = flatten(envelope);
       await transcript.event('tool', { name: call.name, args: call.args, result, envelope });
       r.toolResult(call.name, envelope.summary, envelope.ok, envelope.viewHint);
@@ -630,18 +647,10 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
         `No call ran for ${names}: ${res.withheld.length > 1 ? 'these tools were' : 'this tool was'} withheld because ` +
         `it was not in this turn's tool catalog. If the tool was unlocked by an earlier call in this same reply (e.g. validate_change), ` +
         `call it again next turn.`;
-      if (ctx.finishRequest) {
-        ctx.finishRequest = null;
-        messages.push({
-          role: 'user',
-          content: `${text}\n\nCannot finish yet: ${res.withheld.length} call(s) in this reply did not run (${names}). Complete them before calling finish.`,
-        });
-      } else {
-        messages.push({
-          role: 'user',
-          content: text,
-        });
-      }
+      messages.push({
+        role: 'user',
+        content: text,
+      });
     }
 
     if (ctx.repairCycles > config.maxRepairCycles) {
@@ -660,10 +669,24 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
     if (ctx.finishRequest) {
       const { outcome, summary } = ctx.finishRequest;
       if (outcome === 'done' && opts.finishGuard) {
-        const guardReason = await opts.finishGuard();
+        let guardReason: string | null = null;
+        try {
+          guardReason = await opts.finishGuard();
+        } catch (err) {
+          return fail(`finish guard error: ${(err as Error).message}`, 'finish-guard-error');
+        }
         if (guardReason) {
           log(`finish rejected: ${guardReason}`);
           ctx.finishRequest = null;
+          if (fileMutations !== lastGuardMutationCount) {
+            lastGuardMutationCount = fileMutations;
+            consecutiveGuardRejections = 1;
+          } else {
+            consecutiveGuardRejections++;
+          }
+          if (consecutiveGuardRejections >= 3) {
+            return fail(guardReason, 'stalled');
+          }
           messages.push({
             role: 'user',
             content: `Cannot finish yet: ${guardReason}`,
