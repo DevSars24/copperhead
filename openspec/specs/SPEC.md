@@ -155,11 +155,11 @@ Anything unstated → the agent proposes defaults in SPEC.md and flags them `ASS
 | **Pin map header** | pins.h — generated from PINOUT.md, single source of truth | drift-checked |
 | **Dev plan** | DEVPLAN.md: bring-up steps, test points, what to meter first, risk list, prototype order plan | agent |
 
-Firmware scope: scaffold + pin definitions + driver stubs + one working happy-path (e.g. key press → BLE HID report). "Compiles clean against the vendor toolchain" is the verification gate — same philosophy as ERC/DRC: nothing is done until the toolchain agrees.
+Firmware scope: scaffold + pin definitions + driver stubs + one working happy-path (e.g. key press → BLE HID report). "Compiles clean against the vendor toolchain" is the verification gate — same philosophy as ERC/DRC: nothing is done until the toolchain agrees. A board with nothing programmable on it has no firmware: when every schematic symbol comes from a stock non-programmable KiCad library, `firmware/README.md` opening `# No firmware` and saying why stands in for the scaffold (AC-15.45).
 
 ### The pipeline (Mode A internally)
 
-**Run-to-completion guarantee:** once `create` starts, it always finishes with the complete output package. Gates are *quality checks the agent must satisfy*, not stops that wait for a human. By default the pipeline is fully autonomous: unstated decisions get `ASSUMED` flags, imperfect layout gets the `Draft quality` label, and the run ends with gerbers, firmware, renders, and DEVPLAN.md on disk — an end product, reviewable as a whole. `--interactive` turns the two human gates (spec approval, pre-export review) back on for users who want them.
+**Run-to-completion guarantee:** once `create` starts, it always finishes with the complete output package. Gates are *quality checks the agent must satisfy*, not stops that wait for a human. By default the pipeline is fully autonomous: unstated decisions get `ASSUMED` flags, imperfect layout gets the `Draft quality` label, and the run ends with gerbers, firmware (or, on a board with nothing programmable, a `firmware/README.md` saying why there is none), renders, and DEVPLAN.md on disk — an end product, reviewable as a whole. `--interactive` turns the two human gates (spec approval, pre-export review) back on for users who want them.
 
 **The one stop:** a footprint that is not installed on the machine stops the run for the user (#314). No model turn can install a library, and a substitute package is surrogate geometry on a board that claims to match its schematic. `create` checks every BOM.md footprint before the schematic stage and again when it populates the board, exits non-zero naming each missing part and how to install it, and resumes where it stopped once the library is added. copperhead never downloads parts.
 
@@ -173,7 +173,7 @@ brief.md
   → board populate (deterministic, see below)
   → first-draft layout (see below)             [gate: board matches schematic, DRC]
   → outputs package                            [gate: all exports succeed]
-  → firmware scaffold                          [gate: build passes]
+  → firmware scaffold                          [gate: build passes, or no programmable part]
   → DEVPLAN.md
 ```
 
@@ -571,6 +571,7 @@ Format: Given / When / Then. "Fixture" = the open-telegraph repo (or the tiny te
 - **AC-15.42 (move_footprint)** Layout places parts with the spec-gated `move_footprint` tool (refdes, x, y, rotation), which rotates every pad and text angle with the footprint, since KiCad stores them as absolute, and moves and turns its zones, which KiCad stores in board coordinates; a part moved or turned with it (at any angle) passes DRC without `lib_footprint_mismatch`. A footprint that does not match its library is never excused as library-intrinsic.
 - **AC-15.43 (populated board verified and reversible)** A board populate wrote must pass DRC before the layout-draft stage's first agent turn; otherwise the run stops, naming the findings (and a missing global `fp-lib-table` when KiCad cannot find the libraries). The stage's agent run counts the board as touched, so it cannot finish without a passing `run_drc`. Each retry starts from the last verified board: the board an attempt committed when it still matches the schematic, so a DRC-clean placement is not redone over a documentation gap, else the pre-stage board, re-populated; and a stage that does not complete (a stop, an abort, exhausted retries, an error) leaves the last verified board: byte-identical to the pre-stage board, or, when an attempt committed, to that commit's board, so the tree never reverts HEAD.
 - **AC-15.44 (scaffold hole rules)** The scaffold project allows 0.2 mm holes, so stock footprints' thermal vias pass DRC, and its `.kicad_dru` holds every board via to a 0.3 mm drill.
+- **AC-15.45 (no programmable part, no firmware)** The firmware stage completes on source under `firmware/`, or, only when the schematic has parts and every one comes from a stock non-programmable library (`Device`, `Connector*`, `Diode*`, `Transistor_*`, `Regulator_*`, `Mechanical`, `power`, `Power_Protection`, `LED`, `Switch`, `Jumper`, `Graphic`, `Amplifier_Operational`, `Amplifier_Instrumentation`, `Comparator`, `Reference_Voltage`, `Relay`, `Timer`), on a `firmware/README.md` whose first line is `# No firmware` with a reason written below it (an HTML comment is not one). The schematic decides, not the model: a part from any other library, a project library included (`fixture:ESP32-S3-MINI`), still needs source, and a missing or partless schematic waives nothing (#377).
 
 ### AC-8 · Run observability (change: record-run-metadata)
 
